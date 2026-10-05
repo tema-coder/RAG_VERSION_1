@@ -1,10 +1,18 @@
+import json
 import re
 from pathlib import Path
 
 import pytest
 
+from rag_parser.core.config import settings
 from rag_parser.core.interfaces import DocumentParseError
 from rag_parser.parsers.csv_parser import CsvParser
+from rag_parser.parsers.dedoc_parser import (
+    MARKDOWN_FILE_PREFIX,
+    SUPPORTED_EXTENSIONS as DEDOC_EXTENSIONS,
+    TREE_FILE_PREFIX,
+    DedocParser,
+)
 from rag_parser.parsers.markitdown_parser import (
     SUPPORTED_EXTENSIONS,
     MarkItDownParser,
@@ -12,6 +20,8 @@ from rag_parser.parsers.markitdown_parser import (
 )
 from rag_parser.parsers.xlsx_parser import XlsxParser
 from rag_parser.tests.conftest import CSV_SEMICOLON
+
+DEDOC_SKIP_REASON = "dedoc is not installed (see requirements-dedoc.txt)"
 
 MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|$", re.MULTILINE)
 MARKDOWN_SEPARATOR_RE = re.compile(r"^\|[\s\-|:]+\|$", re.MULTILINE)
@@ -371,3 +381,112 @@ class TestCsvParser:
     def test_blank_file_raises(self, invalid_files):
         with pytest.raises(DocumentParseError, match="empty"):
             CsvParser().parse(invalid_files["blank_csv"])
+
+
+class TestDedocParser:
+    @pytest.fixture
+    def parser(self, tmp_path, monkeypatch):
+        pytest.importorskip("dedoc", reason=DEDOC_SKIP_REASON)
+        output_dir = tmp_path / "output" / "dedoc_results"
+        monkeypatch.setattr(settings, "DEDOC_OUTPUT_DIR", str(output_dir))
+        return DedocParser()
+
+    def test_supported_extensions(self):
+        assert DedocParser().supported_extensions() == DEDOC_EXTENSIONS
+        assert DEDOC_EXTENSIONS == [".docx"]
+        assert DedocParser.format == "dedoc"
+
+    def test_parses_structured_document(self, parser, complex_docx):
+        result = parser.parse(complex_docx)
+        assert result.document_id
+        assert result.filename == complex_docx.name
+        assert result.format == "dedoc"
+        assert_valid_markdown(result.markdown)
+        assert_metadata(
+            result,
+            ["parser", "dedoc_version", "tables", "raw_tree_path", "markdown_path"],
+        )
+        assert result.metadata["parser"] == "dedoc"
+        assert result.metadata["tables"] >= 1
+
+    def test_markdown_contains_headings(self, parser, complex_docx):
+        markdown = parser.parse(complex_docx).markdown
+        assert HEADING_RE.search(markdown)
+        assert markdown.count("\n#") >= 3
+        assert "1. Общие сведения" in markdown
+        assert "2.1 Метрики качества" in markdown
+
+    def test_markdown_contains_tables_and_lists(self, parser, complex_docx):
+        markdown = parser.parse(complex_docx).markdown
+        assert MARKDOWN_TABLE_RE.search(markdown)
+        assert "Метрика" in markdown and "Размер чанка" in markdown
+        assert "- " in markdown
+
+    def test_results_are_saved_to_disk(self, parser, complex_docx, tmp_path):
+        result = parser.parse(complex_docx)
+        document_id = result.document_id
+        tree_path = Path(result.metadata["raw_tree_path"])
+        markdown_path = Path(result.metadata["markdown_path"])
+        output_dir = tmp_path / "output" / "dedoc_results"
+
+        assert tree_path == output_dir / f"{TREE_FILE_PREFIX}_{document_id}.json"
+        assert markdown_path == output_dir / f"{MARKDOWN_FILE_PREFIX}_{document_id}.md"
+        assert tree_path.exists() and markdown_path.exists()
+
+        tree = json.loads(tree_path.read_text(encoding="utf-8"))
+        assert tree["content"]["structure"]["node_id"]
+        assert tree["content"]["tables"]
+        assert tree["metadata"]["file_name"] == complex_docx.name
+        assert markdown_path.read_text(encoding="utf-8") == result.markdown
+
+    def test_tree_preserves_hierarchy_and_tables(self, parser, complex_docx):
+        result = parser.parse(complex_docx)
+        tree = json.loads(Path(result.metadata["raw_tree_path"]).read_text("utf-8"))
+        types = []
+        depths = []
+
+        def walk(node, depth=0):
+            types.append(node["metadata"]["paragraph_type"])
+            depths.append(depth)
+            for child in node.get("subparagraphs") or []:
+                walk(child, depth + 1)
+
+        walk(tree["content"]["structure"])
+        # H1-H3 headers keep their own node type and stay nested in the tree.
+        assert "header" in types
+        assert "list_item" in types
+        assert max(depths) >= 3
+
+        tables = tree["content"]["tables"]
+        assert len(tables) >= 2
+        assert all(table["cells"] for table in tables)
+
+        cells = [cell for table in tables for row in table["cells"] for cell in row]
+        texts = [line["text"] for cell in cells for line in cell["lines"]]
+        assert "Размер чанка" in texts
+        # Merged header cells survive as rowspan/colspan in the raw tree.
+        assert any(cell["rowspan"] > 1 or cell["colspan"] > 1 for cell in cells)
+
+    def test_document_ids_produce_unique_files(self, parser, complex_docx):
+        first = parser.parse(complex_docx)
+        second = parser.parse(complex_docx)
+        assert first.document_id != second.document_id
+        assert first.metadata["raw_tree_path"] != second.metadata["raw_tree_path"]
+
+    def test_missing_file_raises(self, parser, tmp_path):
+        with pytest.raises(DocumentParseError, match="not found"):
+            parser.parse(tmp_path / "missing.docx")
+
+    def test_empty_file_raises(self, parser, tmp_path):
+        path = tmp_path / "empty.docx"
+        path.write_bytes(b"")
+        with pytest.raises(DocumentParseError, match="empty"):
+            parser.parse(path)
+
+    def test_broken_docx_raises(self, parser, invalid_files):
+        with pytest.raises(DocumentParseError, match="dedoc failed"):
+            parser.parse(invalid_files["broken_docx"])
+
+    def test_unsupported_extension_raises(self, parser, text_files):
+        with pytest.raises(DocumentParseError, match="Unsupported extension"):
+            parser.parse(text_files["txt_utf8"])

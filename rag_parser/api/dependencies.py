@@ -32,6 +32,7 @@ TEXT_STRATEGIES: Dict[ChunkingType, str] = {
     ChunkingType.FIXED: "token",
     ChunkingType.SENTENCE: "sentence",
     ChunkingType.SEMANTIC: "semantic",
+    ChunkingType.RECURSIVE: "recursive",
 }
 
 MIME_ALLOWLIST = {

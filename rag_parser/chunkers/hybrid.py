@@ -36,7 +36,8 @@ def _split_block(block: str) -> List[tuple]:
 
 class HybridRagChunker(BaseChunker):
     """Orchestrator: tables always go through ``TableChunkerRAG``, text goes
-    through the selected strategy (``token`` / ``sentence`` / ``semantic``).
+    through the selected strategy (``token`` / ``sentence`` / ``semantic`` /
+    ``recursive``).
 
     Table chunks carry two representations: ``text`` (original Markdown for
     the LLM) and ``text_for_embedding`` (natural language for embeddings).
@@ -46,7 +47,9 @@ class HybridRagChunker(BaseChunker):
 
     def __init__(
         self,
-        text_strategy: Literal["token", "sentence", "semantic"] = "token",
+        text_strategy: Literal[
+            "token", "sentence", "semantic", "recursive"
+        ] = "token",
         chunk_size: Optional[int] = None,
         overlap: Optional[int] = None,
         source: str = "document",
@@ -56,7 +59,7 @@ class HybridRagChunker(BaseChunker):
         from rag_parser.chunkers.sentence import SentenceChunkerRAG
         from rag_parser.chunkers.token import TokenChunkerRAG
 
-        if text_strategy not in ("token", "sentence", "semantic"):
+        if text_strategy not in ("token", "sentence", "semantic", "recursive"):
             raise ValueError(f"Unknown text strategy: {text_strategy}")
         self.text_strategy = text_strategy
         self.source = source
@@ -66,6 +69,12 @@ class HybridRagChunker(BaseChunker):
             )
         elif text_strategy == "sentence":
             self.text_chunker = SentenceChunkerRAG(
+                chunk_size=chunk_size, overlap=overlap, source=source
+            )
+        elif text_strategy == "recursive":
+            from rag_parser.chunkers.recursive import RecursiveChunker
+
+            self.text_chunker = RecursiveChunker(
                 chunk_size=chunk_size, overlap=overlap, source=source
             )
         else:

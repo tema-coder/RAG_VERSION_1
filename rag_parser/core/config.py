@@ -4,6 +4,10 @@ from typing import List
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_DEDOC_OUTPUT_DIR = str(PACKAGE_ROOT / "output" / "dedoc_results")
+
 DEFAULT_SUPPORTED_EXTENSIONS = [
     ".pdf",
     ".xlsx",
@@ -25,6 +29,7 @@ class Settings(BaseSettings):
     SEMANTIC_MODEL_NAME: str = "deepvk/USER-bge-m3"
     SEMANTIC_THRESHOLD: float = 0.5
     TEMP_DIR: str = "./temp"
+    DEDOC_OUTPUT_DIR: str = DEFAULT_DEDOC_OUTPUT_DIR
     LOG_LEVEL: str = "INFO"
     DOC_STORE_MAX_ITEMS: int = 64
     SUPPORTED_EXTENSIONS: List[str] = DEFAULT_SUPPORTED_EXTENSIONS
@@ -36,9 +41,9 @@ class Settings(BaseSettings):
         case_sensitive=True,
     )
 
-    @field_validator("TEMP_DIR")
+    @field_validator("TEMP_DIR", "DEDOC_OUTPUT_DIR")
     @classmethod
-    def _expand_temp_dir(cls, value: str) -> str:
+    def _expand_dir(cls, value: str) -> str:
         return str(Path(value).expanduser())
 
     @property
@@ -51,6 +56,11 @@ class Settings(BaseSettings):
 
     def ensure_temp_dir(self) -> Path:
         path = Path(self.TEMP_DIR)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def ensure_dedoc_output_dir(self) -> Path:
+        path = Path(self.DEDOC_OUTPUT_DIR)
         path.mkdir(parents=True, exist_ok=True)
         return path
 

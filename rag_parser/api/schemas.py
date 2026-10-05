@@ -9,6 +9,7 @@ class ChunkingType(str, Enum):
     FIXED = "fixed"
     SENTENCE = "sentence"
     SEMANTIC = "semantic"
+    RECURSIVE = "recursive"
 
 
 class ParseRequest(BaseModel):

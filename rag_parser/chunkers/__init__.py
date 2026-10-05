@@ -1,4 +1,5 @@
 from rag_parser.chunkers.hybrid import HybridRagChunker
+from rag_parser.chunkers.recursive import RecursiveChunker
 from rag_parser.chunkers.semantic import SemanticChunkerRAG
 from rag_parser.chunkers.sentence import SentenceChunkerRAG
 from rag_parser.chunkers.table import TableChunkerRAG
@@ -8,6 +9,7 @@ __all__ = [
     "TokenChunkerRAG",
     "SentenceChunkerRAG",
     "SemanticChunkerRAG",
+    "RecursiveChunker",
     "TableChunkerRAG",
     "HybridRagChunker",
 ]

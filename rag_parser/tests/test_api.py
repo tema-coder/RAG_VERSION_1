@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -25,7 +26,9 @@ from rag_parser.core.interfaces import (
 from rag_parser.main import app
 from rag_parser.tests.conftest import _build_pdf, _text_ops
 
-CHUNKING_TYPES = ["none", "fixed", "sentence", "semantic"]
+CHUNKING_TYPES = ["none", "fixed", "sentence", "semantic", "recursive"]
+
+DEDOC_SKIP_REASON = "dedoc is not installed (see requirements-dedoc.txt)"
 
 
 @pytest.fixture
@@ -138,6 +141,7 @@ class TestParse:
                 "fixed": "token",
                 "sentence": "sentence",
                 "semantic": "semantic",
+                "recursive": "recursive",
             }[chunking_type]
             assert chunks
             for index, chunk in enumerate(chunks):
@@ -445,6 +449,69 @@ class TestDependenciesUnit:
         assert len(store) == 2
         store.clear()
         assert len(store) == 0
+
+
+class TestParseDedoc:
+    @pytest.fixture(autouse=True)
+    def dedoc_installed(self, tmp_path, monkeypatch):
+        pytest.importorskip("dedoc", reason=DEDOC_SKIP_REASON)
+        monkeypatch.setattr(
+            settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
+        )
+
+    def test_parse_dedoc_saves_results(self, client, complex_docx):
+        files, data = upload(complex_docx)
+        response = client.post("/api/parse_dedoc", files=files, data=data)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["filename"] == complex_docx.name
+        assert body["format"] == "dedoc"
+        assert body["chunks"] is None
+        assert body["markdown"].strip()
+
+        metadata = body["metadata"]
+        assert metadata["parser"] == "dedoc"
+        document_id = body["document_id"]
+        tree_path = Path(metadata["raw_tree_path"])
+        markdown_path = Path(metadata["markdown_path"])
+        assert document_id in tree_path.name
+        assert document_id in markdown_path.name
+        assert tree_path.exists() and markdown_path.exists()
+
+        tree = json.loads(tree_path.read_text(encoding="utf-8"))
+        assert tree["content"]["structure"]
+        assert tree["content"]["tables"]
+
+    def test_parse_dedoc_with_recursive_chunking(self, client, complex_docx):
+        files, data = upload(complex_docx, chunking_type="recursive")
+        response = client.post("/api/parse_dedoc", files=files, data=data)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        chunkers = {chunk["metadata"]["chunker"] for chunk in body["chunks"]}
+        assert "recursive" in chunkers
+        assert chunkers <= {"recursive", "table"}
+
+    def test_download_after_dedoc(self, client, complex_docx):
+        files, data = upload(complex_docx)
+        response = client.post("/api/parse_dedoc", files=files, data=data)
+        document_id = response.json()["document_id"]
+        download = client.get(f"/api/parse/{document_id}/download?format=json")
+        assert download.status_code == 200
+        assert download.json()["metadata"]["parser"] == "dedoc"
+
+    def test_unsupported_extension(self, client, text_files):
+        files, data = upload(text_files["txt_utf8"])
+        response = client.post("/api/parse_dedoc", files=files, data=data)
+        assert response.status_code == 400
+        assert response.headers.get("X-Error-Type") == "unsupported_format"
+
+    def test_invalid_chunk_params(self, client, complex_docx):
+        files, data = upload(complex_docx, chunking_type="recursive", chunk_size="100")
+        response = client.post(
+            "/api/parse_dedoc", files=files, data={**data, "overlap": "100"}
+        )
+        assert response.status_code == 400
+        assert response.headers.get("X-Error-Type") == "invalid_params"
 
 
 class TestAsyncClient:

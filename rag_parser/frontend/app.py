@@ -18,6 +18,7 @@ CHUNKING_LABELS = {
     "Фиксированный по токенам": ChunkingType.FIXED,
     "По предложениям": ChunkingType.SENTENCE,
     "Семантический": ChunkingType.SEMANTIC,
+    "Рекурсивный": ChunkingType.RECURSIVE,
 }
 
 ACCEPTED_TYPES = ["pdf", "xlsx", "xls", "csv", "docx", "html", "txt", "md"]

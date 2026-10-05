@@ -4,6 +4,7 @@ import pytest
 
 from rag_parser.chunkers.base import count_tokens, get_encoding
 from rag_parser.chunkers.hybrid import HybridRagChunker
+from rag_parser.chunkers.recursive import DEFAULT_SEPARATORS, RecursiveChunker
 from rag_parser.chunkers.semantic import SemanticChunkerRAG
 from rag_parser.chunkers.sentence import SentenceChunkerRAG
 from rag_parser.chunkers.table import (
@@ -110,6 +111,109 @@ class TestSentenceChunkerRAG:
     def test_invalid_chunk_size(self):
         with pytest.raises(ValueError):
             SentenceChunkerRAG(chunk_size=0)
+
+
+RECURSIVE_DOC = (
+    "Машинное обучение изучает алгоритмы, которые учатся на данных. "
+    "Модели достигают высокой точности на проверочных наборах.\n"
+    "Классические алгоритмы остаются интерпретируемыми и быстрыми.\n"
+    "Глубокое обучение требует больших объёмов размеченных данных.\n"
+    "\n"
+    "Современные системы достигают уровня человека в ряде задач. "
+    "Это утверждение проверяется на практике.\n"
+    "\n"
+    "Отдельный раздел про инфраструктуру и эксплуатацию моделей. "
+    "В нём описаны только практические детали."
+) * 4
+
+
+class TestRecursiveChunker:
+    def test_defaults(self):
+        chunker = RecursiveChunker()
+        assert chunker.chunk_size == 200
+        assert chunker.overlap == 20
+        assert chunker.separators == DEFAULT_SEPARATORS
+        assert chunker.name == "recursive"
+
+    def test_paragraph_boundaries_are_kept(self):
+        chunks = RecursiveChunker(chunk_size=120, overlap=0).chunk(RECURSIVE_DOC, {})
+        assert_chunk_invariants(chunks)
+        assert len(chunks) > 1
+        # A paragraph that fits the budget is never split by the line level.
+        first_paragraph = (
+            "Машинное обучение изучает алгоритмы, которые учатся на данных. "
+            "Модели достигают высокой точности на проверочных наборах."
+        )
+        assert any(first_paragraph in chunk.text for chunk in chunks)
+
+    def test_sentences_are_kept_when_paragraph_does_not_fit(self):
+        small = RecursiveChunker(chunk_size=40, overlap=0).chunk(RECURSIVE_DOC, {})
+        assert_chunk_invariants(small)
+        for chunk in small:
+            for sentence in _sentences(chunk.text):
+                assert sentence.strip() in RECURSIVE_DOC
+
+    def test_overlap_is_applied(self):
+        without = RecursiveChunker(chunk_size=120, overlap=0).chunk(RECURSIVE_DOC, {})
+        with_overlap = RecursiveChunker(chunk_size=120, overlap=20).chunk(
+            RECURSIVE_DOC, {}
+        )
+        assert len(with_overlap) >= len(without)
+        # Consecutive chunks share the tail of the previous chunk.
+        assert with_overlap[1].text[:20] in with_overlap[0].text
+
+    def test_overlap_never_exceeds_previous_chunk(self):
+        chunks = RecursiveChunker(chunk_size=60, overlap=20).chunk(RECURSIVE_DOC, {})
+        encoding = get_encoding()
+        for previous, current in zip(chunks, chunks[1:]):
+            tail = encoding.decode(
+                encoding.encode(previous.text, disallowed_special=())[-20:]
+            )
+            assert current.text.startswith(tail)
+
+    def test_metadata(self, sample_text):
+        chunks = RecursiveChunker(chunk_size=100, overlap=10).chunk(
+            sample_text, {"source": "report.pdf", "format": "pdf"}
+        )
+        chunk = chunks[0]
+        assert chunk.metadata["chunker"] == "recursive"
+        assert chunk.metadata["chunk_size"] == 100
+        assert chunk.metadata["overlap"] == 10
+        assert chunk.metadata["separators"] == DEFAULT_SEPARATORS
+        assert chunk.source == "report.pdf"
+        assert chunk.metadata["format"] == "pdf"
+        assert "source" not in chunk.metadata
+
+    def test_token_count_matches_text(self):
+        chunks = RecursiveChunker(chunk_size=80, overlap=5).chunk(RECURSIVE_DOC, {})
+        assert all(chunk.tokens == count_tokens(chunk.text) for chunk in chunks)
+
+    def test_custom_separators(self):
+        chunks = RecursiveChunker(
+            chunk_size=60, overlap=0, separators=["\n\n", " "]
+        ).chunk(RECURSIVE_DOC, {})
+        assert_chunk_invariants(chunks)
+
+    def test_short_text(self):
+        chunks = RecursiveChunker().chunk("Одно предложение.", {})
+        assert len(chunks) == 1
+
+    def test_empty_text(self):
+        assert RecursiveChunker().chunk("", {}) == []
+        assert RecursiveChunker().chunk("  \n ", {}) == []
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"chunk_size": 0},
+            {"chunk_size": 100, "overlap": 100},
+            {"chunk_size": 100, "overlap": 150},
+            {"chunk_size": 100, "separators": []},
+        ],
+    )
+    def test_invalid_parameters(self, kwargs):
+        with pytest.raises(ValueError):
+            RecursiveChunker(**kwargs)
 
 
 def _hub_reachable() -> bool:
@@ -254,7 +358,7 @@ class TestHybridRagChunker:
             + "Closing remarks of the document. One more sentence. Final words. " * 6
         )
 
-    @pytest.mark.parametrize("strategy", ["token", "sentence"])
+    @pytest.mark.parametrize("strategy", ["token", "sentence", "recursive"])
     def test_mixed_document(self, strategy):
         hybrid = HybridRagChunker(
             text_strategy=strategy, chunk_size=100, overlap=10, table_chunk_size=5

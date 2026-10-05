@@ -61,6 +61,21 @@ def make_html_files(tmp_path: Path) -> dict:
     }
 
 
+COMPLEX_DOCX = (
+    Path(__file__).resolve().parent.parent / "test_data" / "complex_structured.docx"
+)
+
+
+@pytest.fixture(scope="session")
+def complex_docx() -> Path:
+    """Path to the structured DOCX fixture, generated on demand."""
+    if not COMPLEX_DOCX.exists():
+        from rag_parser.scripts.generate_test_doc import generate
+
+        generate(COMPLEX_DOCX)
+    return COMPLEX_DOCX
+
+
 def make_docx_files(tmp_path: Path) -> dict:
     from docx import Document
 
