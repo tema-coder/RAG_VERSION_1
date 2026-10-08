@@ -391,3 +391,58 @@ class TestHybridRagChunker:
 
     def test_empty_text(self):
         assert HybridRagChunker().chunk("", {}) == []
+
+
+def _crumb_tree():
+    from rag_parser.core.interfaces import DocumentNode
+
+    def node(node_type, text, children=None, level=1):
+        return DocumentNode(
+            type=node_type, level=level, text=text,
+            children=children or [], metadata={},
+        )
+
+    return DocumentNode(
+        type="document", level=0, text="", children=[
+            node("header", "Раздел 2", [
+                node("header", "2.3 Основные показатели", [
+                    node("paragraph", "Текст про показатели."),
+                    node("table", "| A | B |\n|---|---|\n| 1 | 2 |", level=0),
+                ]),
+            ]),
+        ], metadata={},
+    )
+
+
+class TestHybridBreadcrumbEnrichment:
+    def test_text_chunks(self):
+        hybrid = HybridRagChunker(text_strategy="token", chunk_size=100, overlap=10)
+        chunks = hybrid.chunk("ignored", {"source": "doc.md"}, tree=_crumb_tree())
+        texts = [c for c in chunks if c.metadata["chunk_type"] == "text"]
+        assert [c for c in texts if c.breadcrumb]
+        for chunk in [c for c in texts if c.breadcrumb]:
+            assert chunk.text_for_embedding == f"[{chunk.breadcrumb}] {chunk.text}"
+
+    def test_table_chunks(self):
+        hybrid = HybridRagChunker(text_strategy="token", chunk_size=100, overlap=10)
+        chunks = hybrid.chunk("ignored", {"source": "doc.md"}, tree=_crumb_tree())
+        tables = [c for c in chunks if c.metadata["chunk_type"] == "table"]
+        assert tables
+        for chunk in tables:
+            assert chunk.breadcrumb == "Раздел 2 > 2.3 Основные показатели"
+            assert chunk.text.startswith(f"[{chunk.breadcrumb}] ")
+            assert chunk.text_for_embedding.startswith(f"[{chunk.breadcrumb}] ")
+            assert "|" not in chunk.text_for_embedding
+
+    def test_no_headers(self):
+        from rag_parser.core.interfaces import DocumentNode
+
+        tree = DocumentNode(
+            type="document", level=0, text="", children=[
+                DocumentNode(type="paragraph", level=0, text="Просто текст.",
+                             children=[], metadata={}),
+            ], metadata={},
+        )
+        hybrid = HybridRagChunker(text_strategy="token", chunk_size=100, overlap=10)
+        chunks = hybrid.chunk("ignored", {}, tree=tree)
+        assert all(c.breadcrumb is None for c in chunks)

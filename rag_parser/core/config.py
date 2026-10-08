@@ -9,15 +9,15 @@ PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DEDOC_OUTPUT_DIR = str(PACKAGE_ROOT / "output" / "dedoc_results")
 
 DEFAULT_SUPPORTED_EXTENSIONS = [
-    ".pdf",
+    ".docx",
     ".xlsx",
     ".xls",
-    ".csv",
-    ".docx",
+    ".pdf",
     ".html",
     ".htm",
     ".txt",
-    ".md",
+    ".csv",
+    ".tsv",
 ]
 
 
@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     DOC_STORE_MAX_ITEMS: int = 64
     SUPPORTED_EXTENSIONS: List[str] = DEFAULT_SUPPORTED_EXTENSIONS
+    HEADER_PROMOTION_THRESHOLD: float = 4.0
+    BREADCRUMB_MAX_DEPTH: int = 3
+    TREE_TEXT_PREVIEW_LEN: int = 30
 
     model_config = SettingsConfigDict(
         env_file=".env",

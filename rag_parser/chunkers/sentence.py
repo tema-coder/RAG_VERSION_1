@@ -34,7 +34,9 @@ class SentenceChunkerRAG(BaseChunker):
         self.source = source
         self.min_sentences_per_chunk = min_sentences_per_chunk
         self.chunker = _ChonkieSentenceChunker(
-            tokenizer="cl100k_base",
+            # Первый аргумент позиционно: в chonkie 1.3.x он называется
+            # ``tokenizer_or_token_counter``, в 1.7.x — ``tokenizer``.
+            "cl100k_base",
             chunk_size=self.chunk_size,
             min_sentences_per_chunk=self.min_sentences_per_chunk,
         )

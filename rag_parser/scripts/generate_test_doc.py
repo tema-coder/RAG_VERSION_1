@@ -160,13 +160,13 @@ def build_document():
     formats.cell(0, 1).text = "Парсер"
     formats.cell(0, 2).text = "Особенности"
     formats.cell(1, 0).text = "DOCX"
-    formats.cell(1, 1).text = "MarkItDownParser"
+    formats.cell(1, 1).text = "DedocParser"
     formats.cell(1, 2).text = "Структура, таблицы"
     formats.cell(2, 0).text = "XLSX"
-    formats.cell(2, 1).text = "XlsxParser"
+    formats.cell(2, 1).text = "DedocParser"
     formats.cell(2, 2).text = "Объединённые ячейки"
     formats.cell(3, 0).text = "CSV"
-    formats.cell(3, 1).text = "CsvParser"
+    formats.cell(3, 1).text = "DedocParser"
     formats.cell(3, 2).text = "Автодетект разделителя"
     # Nested list inside a cell.
     _add_nested_cell_list(
@@ -196,7 +196,7 @@ def build_document():
     )
     code = document.add_paragraph()
     code.add_run(
-        "curl -X POST http://localhost:8000/api/parse_dedoc "
+        "curl -X POST http://localhost:8000/api/parse "
         "-F \"file=@complex_structured.docx\""
     ).font.name = "Courier New"
 

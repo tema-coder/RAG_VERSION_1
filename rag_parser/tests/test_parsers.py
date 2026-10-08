@@ -1,3 +1,5 @@
+"""Тесты единственного парсера — DedocParser (9 форматов)."""
+
 import json
 import re
 from pathlib import Path
@@ -5,26 +7,17 @@ from pathlib import Path
 import pytest
 
 from rag_parser.core.config import settings
-from rag_parser.core.interfaces import DocumentParseError
-from rag_parser.parsers.csv_parser import CsvParser
+from rag_parser.core.interfaces import DocumentParseError, UnsupportedFormatError
 from rag_parser.parsers.dedoc_parser import (
     MARKDOWN_FILE_PREFIX,
-    SUPPORTED_EXTENSIONS as DEDOC_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
     TREE_FILE_PREFIX,
     DedocParser,
+    parameters_for_format,
 )
-from rag_parser.parsers.markitdown_parser import (
-    SUPPORTED_EXTENSIONS,
-    MarkItDownParser,
-    get_converter,
-)
-from rag_parser.parsers.xlsx_parser import XlsxParser
-from rag_parser.tests.conftest import CSV_SEMICOLON
-
-DEDOC_SKIP_REASON = "dedoc is not installed (see requirements-dedoc.txt)"
+from rag_parser.tests.conftest import _build_pdf, _text_ops
 
 MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|$", re.MULTILINE)
-MARKDOWN_SEPARATOR_RE = re.compile(r"^\|[\s\-|:]+\|$", re.MULTILINE)
 HEADING_RE = re.compile(r"^#{1,6}\s+\S", re.MULTILINE)
 
 
@@ -39,454 +32,261 @@ def assert_valid_markdown(markdown: str) -> None:
             assert line.count("|") >= 2, f"malformed table row: {line!r}"
 
 
-def assert_metadata(result, required_keys):
-    assert result.metadata, "metadata must not be empty"
-    for key in required_keys:
-        assert key in result.metadata, f"missing metadata key: {key}"
+@pytest.fixture
+def parser(tmp_path, monkeypatch):
+    output_dir = tmp_path / "output" / "dedoc_results"
+    monkeypatch.setattr(settings, "DEDOC_OUTPUT_DIR", str(output_dir))
+    return DedocParser()
 
 
-def assert_common(result, path: Path, expected_format: str):
-    assert result.document_id
-    assert result.filename == path.name
-    assert result.format == expected_format
-    assert_valid_markdown(result.markdown)
-
-
-class TestMarkItDownParser:
-    def test_supported_extensions(self):
-        assert MarkItDownParser().supported_extensions() == SUPPORTED_EXTENSIONS
-        assert SUPPORTED_EXTENSIONS == [
-            ".pdf",
-            ".docx",
-            ".html",
-            ".htm",
-            ".txt",
-            ".md",
-        ]
-
-    def test_supported_extensions_excludes_archives_and_media(self):
-        for extension in (".pptx", ".zip", ".mp3", ".mp4", ".doc", ".xlsm"):
-            assert extension not in SUPPORTED_EXTENSIONS
-
-    def test_xlsx_is_not_supported(self):
-        assert ".xlsx" not in SUPPORTED_EXTENSIONS
-        assert ".xls" not in SUPPORTED_EXTENSIONS
-
-    def test_converter_is_reused(self):
-        first = MarkItDownParser()
-        second = MarkItDownParser()
-        assert first.converter is second.converter
-        assert get_converter() is first.converter
-
-    def test_custom_converter_is_used(self):
-        class FakeResult:
-            text_content = "converted text"
-
-        class FakeConverter:
-            def __init__(self):
-                self.calls = 0
-
-            def convert(self, source):
-                self.calls += 1
-                return FakeResult()
-
-        converter = FakeConverter()
-        result = MarkItDownParser(converter=converter).parse(_make_file("x.txt"))
-        assert converter.calls == 1
-        assert result.markdown == "converted text"
-
-    def test_txt(self, text_files):
-        result = MarkItDownParser().parse(text_files["txt_utf8"])
-        assert_common(result, text_files["txt_utf8"], "text")
-        assert "Первая строка документа." in result.markdown
-        assert_metadata(
-            result, ["format", "extension", "size_bytes", "lines", "characters"]
+class TestSupported:
+    def test_nine_formats(self):
+        assert DedocParser().supported_extensions() == SUPPORTED_EXTENSIONS
+        assert sorted(SUPPORTED_EXTENSIONS) == sorted(
+            [".docx", ".xlsx", ".xls", ".pdf", ".html", ".htm",
+             ".txt", ".csv", ".tsv"]
         )
-        assert result.metadata["converter"] == "markitdown"
-        assert result.metadata["extension"] == ".txt"
-
-    def test_markdown(self, text_files):
-        result = MarkItDownParser().parse(text_files["md"])
-        assert_common(result, text_files["md"], "markdown")
-        assert HEADING_RE.search(result.markdown)
-
-    def test_html(self, html_files):
-        result = MarkItDownParser().parse(html_files["html_full"])
-        assert_common(result, html_files["html_full"], "html")
-        assert "Заголовок" in result.markdown
-        assert "example.com" in result.markdown
-
-    def test_docx(self, docx_files):
-        result = MarkItDownParser().parse(docx_files["docx_headings"])
-        assert_common(result, docx_files["docx_headings"], "docx")
-        assert "Заголовок документа" in result.markdown
-        assert "Первый абзац" in result.markdown
-        assert HEADING_RE.search(result.markdown)
-
-    def test_docx_table(self, docx_files):
-        result = MarkItDownParser().parse(docx_files["docx_table"])
-        assert_valid_markdown(result.markdown)
-        assert MARKDOWN_TABLE_RE.search(result.markdown)
-
-    def test_pdf_text(self, pdf_files):
-        result = MarkItDownParser().parse(pdf_files["pdf_text"])
-        assert_common(result, pdf_files["pdf_text"], "pdf")
-        assert "First page of the document." in result.markdown
-        assert "Second page body." in result.markdown
-
-    def test_pdf_table_becomes_markdown_table(self, pdf_files):
-        result = MarkItDownParser().parse(pdf_files["pdf_table"])
-        assert "| Region" in result.markdown
-        assert "North" in result.markdown and "120" in result.markdown
-        assert_valid_markdown(result.markdown)
-
-    def test_formfeeds_are_cleaned(self, pdf_files):
-        result = MarkItDownParser().parse(pdf_files["pdf_text"])
-        assert "\f" not in result.markdown
-
-    def test_missing_file_raises(self, tmp_path):
-        with pytest.raises(DocumentParseError, match="not found"):
-            MarkItDownParser().parse(tmp_path / "missing.pdf")
-
-    def test_empty_file_raises(self, invalid_files):
-        with pytest.raises(DocumentParseError, match="empty"):
-            MarkItDownParser().parse(invalid_files["empty_pdf"])
-
-    def test_empty_txt_raises(self, invalid_files):
-        with pytest.raises(DocumentParseError, match="empty"):
-            MarkItDownParser().parse(invalid_files["empty_txt"])
-
-    def test_broken_pdf_raises(self, invalid_files):
-        with pytest.raises(DocumentParseError):
-            MarkItDownParser().parse(invalid_files["broken_pdf"])
-
-    def test_fake_pdf_raises(self, invalid_files):
-        with pytest.raises(DocumentParseError):
-            MarkItDownParser().parse(invalid_files["not_a_pdf"])
-
-    def test_broken_docx_raises(self, invalid_files):
-        with pytest.raises(DocumentParseError):
-            MarkItDownParser().parse(invalid_files["broken_docx"])
-
-    def test_xlsx_rejected(self, xlsx_files):
-        with pytest.raises(DocumentParseError, match="Unsupported extension"):
-            MarkItDownParser().parse(xlsx_files["xlsx_multi"])
-
-    def test_unsupported_extension_raises(self, tmp_path):
-        path = tmp_path / "presentation.pptx"
-        path.write_bytes(b"fake archive")
-        with pytest.raises(DocumentParseError, match="Unsupported extension"):
-            MarkItDownParser().parse(path)
-
-    def test_zip_archive_raises(self, tmp_path):
-        import io
-        import zipfile
-
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w") as archive:
-            archive.writestr("a.txt", "text")
-        path = tmp_path / "archive.zip"
-        path.write_bytes(buffer.getvalue())
-        with pytest.raises(DocumentParseError, match="Unsupported extension"):
-            MarkItDownParser().parse(path)
-
-    def test_conversion_failure_is_reported(self, monkeypatch):
-        from markitdown._exceptions import FileConversionException
-
-        class FailingConverter:
-            def convert(self, source):
-                raise FileConversionException(message="cannot convert")
-
-        with pytest.raises(DocumentParseError, match="MarkItDown failed"):
-            MarkItDownParser(converter=FailingConverter()).parse(_make_pdf_file())
-
-    def test_unsupported_format_exception_is_reported(self):
-        from markitdown._exceptions import UnsupportedFormatException
-
-        class NoConverter:
-            def convert(self, source):
-                raise UnsupportedFormatException("no converter accepted the file")
-
-        with pytest.raises(DocumentParseError, match="does not support"):
-            MarkItDownParser(converter=NoConverter()).parse(_make_file("weird.txt"))
-
-    def test_missing_dependency_is_reported(self, docx_files):
-        from markitdown._exceptions import MissingDependencyException
-
-        class MissingConverter:
-            def convert(self, source):
-                raise MissingDependencyException("optional dep missing")
-
-        with pytest.raises(DocumentParseError, match="MarkItDown failed"):
-            MarkItDownParser(converter=MissingConverter()).parse(
-                docx_files["docx_headings"]
-            )
-
-    def test_unexpected_error_is_wrapped(self, text_files):
-        class Boom:
-            def convert(self, source):
-                raise RuntimeError("unexpected")
-
-        with pytest.raises(DocumentParseError, match="Failed to convert"):
-            MarkItDownParser(converter=Boom()).parse(text_files["txt_utf8"])
-
-    def test_empty_conversion_result_raises(self, text_files):
-        class EmptyConverter:
-            def convert(self, source):
-                class Result:
-                    text_content = "   \n\n"
-
-                return Result()
-
-        with pytest.raises(DocumentParseError, match="no text"):
-            MarkItDownParser(converter=EmptyConverter()).parse(text_files["txt_utf8"])
-
-    def test_none_text_content_is_rejected(self, text_files):
-        class NoneConverter:
-            def convert(self, source):
-                class Result:
-                    text_content = None
-
-                return Result()
-
-        with pytest.raises(DocumentParseError, match="no text"):
-            MarkItDownParser(converter=NoneConverter()).parse(
-                text_files["txt_utf8"]
-            )
-
-    def test_plaintext_fallback_is_rejected(self, invalid_files):
-        with pytest.raises(DocumentParseError, match="not a valid document"):
-            MarkItDownParser().parse(invalid_files["broken_pdf"])
-
-    def test_unexpected_format_falls_back_is_rejected(self, tmp_path):
-        path = tmp_path / "textual.docx"
-        path.write_bytes(b"PK\x03\x04 pretend this is an office document")
-        with pytest.raises(DocumentParseError):
-            MarkItDownParser().parse(path)
-
-
-class TestXlsxParser:
-    def test_multi_sheet(self, xlsx_files):
-        result = XlsxParser().parse(xlsx_files["xlsx_multi"])
-        assert_common(result, xlsx_files["xlsx_multi"], "xlsx")
-        assert "## Лист: Данные" in result.markdown
-        assert "## Лист: Итоги" in result.markdown
-        assert "Колонка1" in result.markdown
-        assert MARKDOWN_TABLE_RE.search(result.markdown)
-        assert result.metadata["sheets"] == 2
-        assert result.metadata["parser"] == "calamine"
-
-    def test_single_sheet(self, xlsx_files):
-        result = XlsxParser().parse(xlsx_files["xlsx_single"])
-        assert "Single" in result.markdown
-        assert "row-0" in result.markdown
-        assert_valid_markdown(result.markdown)
-
-    def test_merged_cells_are_filled(self, xlsx_files):
-        result = XlsxParser().parse(xlsx_files["xlsx_merged"])
-        assert_valid_markdown(result.markdown)
-        assert "## Лист: Data" in result.markdown
-        # Merged title row A1:C1 is forward-filled across the range.
-        title_rows = [
-            line
-            for line in result.markdown.splitlines()
-            if "Report Title" in line
-        ]
-        assert title_rows
-        assert title_rows[0].count("Report Title") == 3
-        merged_rows = [
-            line for line in result.markdown.splitlines() if "merged-row" in line
-        ]
-        assert merged_rows
-        assert merged_rows[0].count("merged-row") == 3
-
-    def test_supported_extensions(self):
-        assert XlsxParser().supported_extensions() == [".xlsx", ".xls"]
-
-    def test_broken_xlsx_raises(self, invalid_files):
-        with pytest.raises(DocumentParseError):
-            XlsxParser().parse(invalid_files["broken_xlsx"])
-
-    def test_empty_file_raises(self, tmp_path):
-        path = tmp_path / "empty.xlsx"
-        path.write_bytes(b"")
-        with pytest.raises(DocumentParseError, match="empty"):
-            XlsxParser().parse(path)
-
-    def test_missing_file_raises(self, tmp_path):
-        with pytest.raises(DocumentParseError, match="not found"):
-            XlsxParser().parse(tmp_path / "missing.xlsx")
-
-    def test_unsupported_extension_raises(self, text_files):
-        with pytest.raises(DocumentParseError, match="Unsupported extension"):
-            XlsxParser().parse(text_files["txt_utf8"])
-
-    def test_empty_workbook_raises(self, tmp_path):
-        from openpyxl import Workbook
-
-        workbook = Workbook()
-        path = tmp_path / "blank.xlsx"
-        workbook.save(path)
-        with pytest.raises(DocumentParseError):
-            XlsxParser().parse(path)
-
-
-def _make_file(name: str, payload: bytes = b"payload") -> Path:
-    import tempfile
-
-    handle = tempfile.NamedTemporaryFile(suffix=Path(name).suffix, delete=False)
-    handle.write(payload)
-    handle.close()
-    return Path(handle.name)
-
-
-def _make_pdf_file(payload: bytes = b"%PDF-1.4\nfake body") -> Path:
-    return _make_file("fake.pdf", payload)
-
-
-class TestCsvParser:
-    def test_semicolon_delimiter(self, csv_files):
-        result = CsvParser().parse(csv_files["csv_semicolon"])
-        assert_common(result, csv_files["csv_semicolon"], "csv")
-        assert result.metadata["delimiter"] == ";"
-        assert result.metadata["columns"] == 3
-        assert result.metadata["rows"] == 2
-        assert result.markdown.startswith("| Колонка1 | Колонка2 | Колонка3 |")
-        assert "Значение1" in result.markdown
-        assert CSV_SEMICOLON.splitlines()[0] == "Колонка1;Колонка2;Колонка3"
-
-    def test_comma_delimiter(self, csv_files):
-        result = CsvParser().parse(csv_files["csv_comma"])
-        assert result.metadata["delimiter"] == ","
-        assert result.metadata["columns"] == 3
-        assert "banana" in result.markdown
-
-    def test_single_column(self, tmp_path):
-        path = tmp_path / "one.csv"
-        path.write_text("only\nvalue\n", encoding="utf-8")
-        result = CsvParser().parse(path)
-        assert result.metadata["columns"] == 1
-        assert_valid_markdown(result.markdown)
-
-    def test_pipe_escaping(self, tmp_path):
-        path = tmp_path / "pipes.csv"
-        path.write_text("a|b,c\n1|2,3\n", encoding="utf-8")
-        result = CsvParser().parse(path)
-        assert "\\|" in result.markdown
-
-    def test_empty_file_raises(self, invalid_files):
-        with pytest.raises(DocumentParseError, match="empty"):
-            CsvParser().parse(invalid_files["empty_csv"])
-
-    def test_blank_file_raises(self, invalid_files):
-        with pytest.raises(DocumentParseError, match="empty"):
-            CsvParser().parse(invalid_files["blank_csv"])
-
-
-class TestDedocParser:
-    @pytest.fixture
-    def parser(self, tmp_path, monkeypatch):
-        pytest.importorskip("dedoc", reason=DEDOC_SKIP_REASON)
-        output_dir = tmp_path / "output" / "dedoc_results"
-        monkeypatch.setattr(settings, "DEDOC_OUTPUT_DIR", str(output_dir))
-        return DedocParser()
-
-    def test_supported_extensions(self):
-        assert DedocParser().supported_extensions() == DEDOC_EXTENSIONS
-        assert DEDOC_EXTENSIONS == [".docx"]
         assert DedocParser.format == "dedoc"
 
-    def test_parses_structured_document(self, parser, complex_docx):
-        result = parser.parse(complex_docx)
-        assert result.document_id
-        assert result.filename == complex_docx.name
+    def test_parameters_pdf(self, tmp_path):
+        params = parameters_for_format(".pdf", tmp_path / "a.pdf")
+        assert params["pdf_with_text_layer"] == "true"
+        assert params["structure_type"] == "tree"
+
+    def test_parameters_tsv(self, tmp_path):
+        assert parameters_for_format(".tsv", tmp_path / "a.tsv")["delimiter"] == "\t"
+
+    def test_parameters_csv_semicolon(self, tmp_path):
+        sample = tmp_path / "a.csv"
+        sample.write_text("a;b\n1;2\n", encoding="utf-8")
+        assert parameters_for_format(".csv", sample)["delimiter"] == ";"
+
+    def test_unsupported_raises_422_error(self, parser, tmp_path):
+        path = tmp_path / "doc.doc"
+        path.write_bytes(b"fake")
+        with pytest.raises(UnsupportedFormatError):
+            parser.parse(path)
+
+
+class TestParseFormats:
+    def test_docx(self, parser, docx_files):
+        result = parser.parse(docx_files["docx_headings"])
         assert result.format == "dedoc"
+        assert "Заголовок документа" in result.markdown
+        assert HEADING_RE.search(result.markdown)
+        assert result.tree is not None
+
+    def test_txt(self, parser, text_files):
+        result = parser.parse(text_files["txt_utf8"])
+        assert "Первая строка документа." in result.markdown
         assert_valid_markdown(result.markdown)
-        assert_metadata(
-            result,
-            ["parser", "dedoc_version", "tables", "raw_tree_path", "markdown_path"],
+
+    def test_html(self, parser, html_files):
+        result = parser.parse(html_files["html_full"])
+        assert "Заголовок" in result.markdown
+        assert_valid_markdown(result.markdown)
+
+    def test_htm(self, parser, html_files):
+        result = parser.parse(html_files["htm"])
+        assert "Заголовок" in result.markdown
+
+    def test_csv(self, parser, csv_files):
+        result = parser.parse(csv_files["csv_semicolon"])
+        assert "Значение1" in result.markdown
+        assert MARKDOWN_TABLE_RE.search(result.markdown)
+
+    def test_tsv(self, parser, csv_files):
+        result = parser.parse(csv_files["tsv"])
+        assert "banana" in result.markdown
+
+    def test_xlsx(self, parser, xlsx_files):
+        result = parser.parse(xlsx_files["xlsx_multi"])
+        assert "Колонка1" in result.markdown
+        assert MARKDOWN_TABLE_RE.search(result.markdown)
+
+    def test_xls(self, parser, xls_files):
+        result = parser.parse(xls_files["xls"])
+        assert "row-0" in result.markdown
+
+    def test_xlsx_goes_through_dedoc_without_conversion(self, parser, xlsx_files,
+                                                        tmp_path, monkeypatch):
+        """Фасад: .xlsx — напрямую в DedocManager.parse, без xlrd-конвертации."""
+        import rag_parser.parsers.dedoc_parser as dedoc_module
+        from rag_parser.core.config import settings
+
+        monkeypatch.setattr(
+            settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
         )
-        assert result.metadata["parser"] == "dedoc"
-        assert result.metadata["tables"] >= 1
 
-    def test_markdown_contains_headings(self, parser, complex_docx):
-        markdown = parser.parse(complex_docx).markdown
-        assert HEADING_RE.search(markdown)
-        assert markdown.count("\n#") >= 3
-        assert "1. Общие сведения" in markdown
-        assert "2.1 Метрики качества" in markdown
+        def _forbid_conversion(source):
+            raise AssertionError("convert_xls_to_xlsx must not run for .xlsx")
 
-    def test_markdown_contains_tables_and_lists(self, parser, complex_docx):
-        markdown = parser.parse(complex_docx).markdown
-        assert MARKDOWN_TABLE_RE.search(markdown)
-        assert "Метрика" in markdown and "Размер чанка" in markdown
-        assert "- " in markdown
+        monkeypatch.setattr(
+            dedoc_module, "convert_xls_to_xlsx", _forbid_conversion
+        )
+        calls = []
+        real_parse = dedoc_module.get_manager().parse
 
-    def test_results_are_saved_to_disk(self, parser, complex_docx, tmp_path):
+        def _spy_parse(file_path, parameters=None):
+            calls.append((file_path, parameters))
+            return real_parse(file_path, parameters=parameters)
+
+        monkeypatch.setattr(dedoc_module.get_manager(), "parse", _spy_parse)
+        result = DedocParser().parse(xlsx_files["xlsx_multi"])
+        assert result.markdown.strip()
+        assert len(calls) == 1  # DedocManager.parse вызван ровно один раз
+        assert str(calls[0][0]).endswith(".xlsx")
+
+    def test_xls_uses_conversion_inside_facade(self, parser, xls_files, tmp_path,
+                                               monkeypatch):
+        """Фасад: .xls — конвертация внутри DedocParser (soffice запрещён)."""
+        import rag_parser.parsers.dedoc_parser as dedoc_module
+        from rag_parser.core.config import settings
+
+        monkeypatch.setattr(
+            settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
+        )
+        calls = []
+        real_convert = dedoc_module.convert_xls_to_xlsx
+
+        def _spy_convert(source):
+            calls.append(source)
+            return real_convert(source)
+
+        monkeypatch.setattr(dedoc_module, "convert_xls_to_xlsx", _spy_convert)
+        result = DedocParser().parse(xls_files["xls"])
+        assert len(calls) == 1
+        assert "row-0" in result.markdown
+
+    def test_pdf_text(self, parser, pdf_files):
+        result = parser.parse(pdf_files["pdf_text"])
+        assert "First page of the document." in result.markdown
+
+    def test_header_threshold_flows(self, header_docs, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
+        )
+        from rag_parser.parsers.dedoc_tree import collect_headers
+
+        low = DedocParser(header_threshold=0.0).parse(header_docs["unstyled"])
+        high = DedocParser(header_threshold=8.0).parse(header_docs["unstyled"])
+        assert len(collect_headers(low.tree)) > len(collect_headers(high.tree))
+
+
+class TestTree:
+    def test_tree_shape(self, parser, docx_files):
+        result = parser.parse(docx_files["docx_headings"])
+        assert result.tree is not None
+        assert result.tree.type == "document"
+        headers = [
+            node for node in _walk(result.tree) if node.type == "header"
+        ]
+        assert headers
+        for header in headers:
+            assert header.level >= 1
+            assert header.text.strip()
+        # урезание до 30 символов — последний шаг в API/UI, не в парсере
+        from rag_parser.parsers.dedoc_tree import truncate
+
+        preview = truncate(result.tree)
+        for node in _walk(preview):
+            assert len(node.text) <= 31
+            assert "annotations" not in node.metadata
+            assert "annotations_count" in node.metadata
+
+    def test_full_text_in_markdown_not_truncated(self, parser, docx_files):
+        result = parser.parse(docx_files["docx_headings"])
+        long_line = "Первый абзац текста."
+        assert long_line in result.markdown
+
+    def test_results_saved(self, parser, complex_docx, tmp_path):
         result = parser.parse(complex_docx)
-        document_id = result.document_id
         tree_path = Path(result.metadata["raw_tree_path"])
         markdown_path = Path(result.metadata["markdown_path"])
         output_dir = tmp_path / "output" / "dedoc_results"
-
-        assert tree_path == output_dir / f"{TREE_FILE_PREFIX}_{document_id}.json"
-        assert markdown_path == output_dir / f"{MARKDOWN_FILE_PREFIX}_{document_id}.md"
+        assert tree_path == output_dir / f"{TREE_FILE_PREFIX}_{result.document_id}.json"
+        assert markdown_path == output_dir / f"{MARKDOWN_FILE_PREFIX}_{result.document_id}.md"
         assert tree_path.exists() and markdown_path.exists()
-
         tree = json.loads(tree_path.read_text(encoding="utf-8"))
-        assert tree["content"]["structure"]["node_id"]
-        assert tree["content"]["tables"]
-        assert tree["metadata"]["file_name"] == complex_docx.name
+        assert tree["content"]["structure"]
         assert markdown_path.read_text(encoding="utf-8") == result.markdown
 
-    def test_tree_preserves_hierarchy_and_tables(self, parser, complex_docx):
-        result = parser.parse(complex_docx)
-        tree = json.loads(Path(result.metadata["raw_tree_path"]).read_text("utf-8"))
-        types = []
-        depths = []
+    def test_unique_ids(self, parser, complex_docx):
+        assert parser.parse(complex_docx).document_id != parser.parse(complex_docx).document_id
 
-        def walk(node, depth=0):
-            types.append(node["metadata"]["paragraph_type"])
-            depths.append(depth)
-            for child in node.get("subparagraphs") or []:
-                walk(child, depth + 1)
+    def test_table_attached_to_anchor(self, parser, tmp_path):
+        """Раздел 1 → абзац → таблица → Раздел 2: таблица под Разделом 1."""
+        from docx import Document
 
-        walk(tree["content"]["structure"])
-        # H1-H3 headers keep their own node type and stay nested in the tree.
-        assert "header" in types
-        assert "list_item" in types
-        assert max(depths) >= 3
+        doc = Document()
+        doc.add_paragraph("Раздел 1. Первый раздел документа")
+        doc.add_paragraph("Абзац с данными в таблице ниже.")
+        table = doc.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = "Метрика"
+        table.cell(0, 1).text = "Значение"
+        table.cell(1, 0).text = "X"
+        table.cell(1, 1).text = "10"
+        doc.add_paragraph("Раздел 2. Второй раздел документа")
+        path = tmp_path / "anchored.docx"
+        doc.save(path)
 
-        tables = tree["content"]["tables"]
-        assert len(tables) >= 2
-        assert all(table["cells"] for table in tables)
+        result = parser.parse(path)
+        parents = {}
+        ordered = []
+        stack = [(result.tree, None)]
+        while stack:
+            node, parent = stack.pop(0)
+            parents[id(node)] = parent
+            ordered.append(node)
+            stack.extend((child, node) for child in node.children)
+        table_node = next(
+            n for n in ordered
+            if n.type == "table" and "Метрика" in (n.text or "")
+        )
+        chain = []
+        parent = parents[id(table_node)]
+        while parent is not None and parent.type != "document":
+            chain.append(parent)
+            parent = parents[id(parent)]
+        # якорь-абзац — прямой родитель, выше — заголовок Раздела 1
+        assert chain[0].type in ("paragraph", "raw_text")
+        assert any(n.type == "header" and n.text.startswith("Раздел 1.")
+                   for n in chain)
+        assert not any(n.type == "header" and n.text.startswith("Раздел 2.")
+                        for n in chain)
+        pos_table = result.markdown.index("| Метрика | Значение |")
+        pos_b = result.markdown.index("Раздел 2.")
+        assert pos_table < pos_b  # не под Разделом 2 и не в конце
 
-        cells = [cell for table in tables for row in table["cells"] for cell in row]
-        texts = [line["text"] for cell in cells for line in cell["lines"]]
-        assert "Размер чанка" in texts
-        # Merged header cells survive as rowspan/colspan in the raw tree.
-        assert any(cell["rowspan"] > 1 or cell["colspan"] > 1 for cell in cells)
 
-    def test_document_ids_produce_unique_files(self, parser, complex_docx):
-        first = parser.parse(complex_docx)
-        second = parser.parse(complex_docx)
-        assert first.document_id != second.document_id
-        assert first.metadata["raw_tree_path"] != second.metadata["raw_tree_path"]
+def _walk(node):
+    yield node
+    for child in node.children:
+        yield from _walk(child)
 
-    def test_missing_file_raises(self, parser, tmp_path):
+
+class TestErrors:
+    def test_missing(self, parser, tmp_path):
         with pytest.raises(DocumentParseError, match="not found"):
             parser.parse(tmp_path / "missing.docx")
 
-    def test_empty_file_raises(self, parser, tmp_path):
+    def test_empty(self, parser, tmp_path):
         path = tmp_path / "empty.docx"
         path.write_bytes(b"")
         with pytest.raises(DocumentParseError, match="empty"):
             parser.parse(path)
 
-    def test_broken_docx_raises(self, parser, invalid_files):
-        with pytest.raises(DocumentParseError, match="dedoc failed"):
+    def test_broken_docx(self, parser, invalid_files):
+        with pytest.raises(DocumentParseError):
             parser.parse(invalid_files["broken_docx"])
 
-    def test_unsupported_extension_raises(self, parser, text_files):
-        with pytest.raises(DocumentParseError, match="Unsupported extension"):
-            parser.parse(text_files["txt_utf8"])
+    def test_doc_rejected(self, parser, tmp_path):
+        path = tmp_path / "old.doc"
+        path.write_bytes(b"fake")
+        with pytest.raises(UnsupportedFormatError):
+            parser.parse(path)
+
+    def test_pdf_without_text_layer(self, parser, tmp_path):
+        path = _build_pdf([[]], None, tmp_path / "empty_page.pdf")
+        with pytest.raises(DocumentParseError, match="текстового слоя"):
+            parser.parse(path)

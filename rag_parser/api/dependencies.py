@@ -15,18 +15,11 @@ from rag_parser.core.interfaces import (
     FileTooLargeError,
     UnsupportedFormatError,
 )
-from rag_parser.parsers.csv_parser import CsvParser
-from rag_parser.parsers.markitdown_parser import (
-    SUPPORTED_EXTENSIONS as MARKITDOWN_EXTENSIONS,
-    MarkItDownParser,
-)
-from rag_parser.parsers.xlsx_parser import XlsxParser
+from rag_parser.parsers.dedoc_parser import SUPPORTED_EXTENSIONS, DedocParser
 
 logger = logging.getLogger(__name__)
 
-PARSERS: Dict[str, type] = {".csv": CsvParser, ".tsv": CsvParser}
-PARSERS.update({extension: XlsxParser for extension in (".xlsx", ".xls")})
-PARSERS.update({extension: MarkItDownParser for extension in MARKITDOWN_EXTENSIONS})
+PARSERS: Dict[str, type] = {extension: DedocParser for extension in SUPPORTED_EXTENSIONS}
 
 TEXT_STRATEGIES: Dict[ChunkingType, str] = {
     ChunkingType.FIXED: "token",
@@ -38,6 +31,7 @@ TEXT_STRATEGIES: Dict[ChunkingType, str] = {
 MIME_ALLOWLIST = {
     "text/plain",
     "text/csv",
+    "text/tab-separated-values",
     "text/markdown",
     "text/html",
     "text/x-csv",
@@ -45,6 +39,8 @@ MIME_ALLOWLIST = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-excel",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/x-ole-storage",  # legacy .xls (BIFF)
+    "application/msword",  # на всякий случай рядом с ole-storage
     "application/zip",
     "application/octet-stream",
     "inode/x-empty",
@@ -55,12 +51,16 @@ def supported_extensions() -> list:
     return sorted(PARSERS.keys())
 
 
-def get_parser(filename: str) -> BaseParser:
+def get_parser(
+    filename: str, header_threshold: Optional[float] = None
+) -> BaseParser:
     extension = Path(filename).suffix.lower()
     parser_class = PARSERS.get(extension)
     if parser_class is None:
         raise UnsupportedFormatError(extension, settings.supported_extensions_set)
-    return parser_class()
+    if header_threshold is None:
+        header_threshold = settings.HEADER_PROMOTION_THRESHOLD
+    return parser_class(header_threshold=header_threshold)
 
 
 def get_chunker(
@@ -114,7 +114,7 @@ def validate_upload(filename: str, data: bytes) -> None:
     mime = sniff_mime(data[:4096])
     if mime and mime not in MIME_ALLOWLIST:
         logger.warning("Unexpected mime type %s for %s", mime, filename)
-        if extension in (".pdf", ".docx", ".xlsx", ".xls", ".xlsm"):
+        if extension in (".pdf", ".docx", ".xlsx", ".xls"):
             raise DocumentParseError(
                 f"File content does not match extension {extension} (detected {mime})",
                 filename=filename,

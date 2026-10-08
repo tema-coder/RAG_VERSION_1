@@ -1,6 +1,5 @@
 import logging
 import time
-from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
@@ -22,6 +21,7 @@ from rag_parser.api.schemas import (
     ErrorResponse,
     HealthResponse,
     ParseResponse,
+    TreeNode,
 )
 from rag_parser.core.config import settings
 from rag_parser.core.interfaces import (
@@ -30,10 +30,6 @@ from rag_parser.core.interfaces import (
     FileTooLargeError,
     ParseResult,
     UnsupportedFormatError,
-)
-from rag_parser.parsers.dedoc_parser import (
-    SUPPORTED_EXTENSIONS as DEDOC_EXTENSIONS,
-    DedocParser,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,8 +49,9 @@ def _chunking_params(
     overlap: Optional[int],
     table_chunk_size: Optional[int],
     threshold: Optional[float],
+    header_threshold: Optional[float],
 ) -> dict:
-    """Resolves and validates the chunking parameters shared by parse routes."""
+    """Resolves and validates the chunking/header parameters of /api/parse."""
     chunk_size = settings.DEFAULT_CHUNK_SIZE if chunk_size is None else chunk_size
     overlap = settings.DEFAULT_OVERLAP if overlap is None else overlap
     table_chunk_size = (
@@ -63,6 +60,8 @@ def _chunking_params(
         else table_chunk_size
     )
     threshold = settings.SEMANTIC_THRESHOLD if threshold is None else threshold
+    if header_threshold is None:
+        header_threshold = settings.HEADER_PROMOTION_THRESHOLD
 
     if overlap >= chunk_size:
         raise _error(400, "overlap must be smaller than chunk_size", "invalid_params")
@@ -80,11 +79,16 @@ def _chunking_params(
         raise _error(
             400, "threshold must be strictly between 0 and 1", "invalid_params"
         )
+    if not 0.0 <= header_threshold <= 8.0:
+        raise _error(
+            400, "header_threshold must be between 0 and 8", "invalid_params"
+        )
     return {
         "chunk_size": chunk_size,
         "overlap": overlap,
         "table_chunk_size": table_chunk_size,
         "threshold": threshold,
+        "header_threshold": header_threshold,
     }
 
 
@@ -99,10 +103,16 @@ def _result_to_response(result: ParseResult) -> ParseResponse:
                 source=chunk.source,
                 metadata=chunk.metadata,
                 text_for_embedding=chunk.text_for_embedding,
+                breadcrumb=chunk.breadcrumb,
             )
             for chunk in result.chunks
         ]
     metadata = dict(result.metadata)
+    tree = None
+    if result.tree is not None:
+        from rag_parser.parsers.dedoc_tree import truncate
+
+        tree = TreeNode(**truncate(result.tree, settings.TREE_TEXT_PREVIEW_LEN).to_dict())
     return ParseResponse(
         document_id=result.document_id,
         filename=result.filename,
@@ -110,6 +120,7 @@ def _result_to_response(result: ParseResult) -> ParseResponse:
         pages=metadata.get("pages"),
         markdown=result.markdown,
         chunks=chunks,
+        tree=tree,
         metadata=metadata,
     )
 
@@ -134,6 +145,7 @@ async def formats() -> dict:
     responses={
         400: {"model": ErrorResponse},
         413: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
     },
 )
@@ -144,15 +156,19 @@ async def parse_document(
     overlap: Optional[int] = Form(None),
     table_chunk_size: Optional[int] = Form(None),
     threshold: Optional[float] = Form(None),
+    header_threshold: Optional[float] = Form(None),
 ) -> ParseResponse:
     started = time.perf_counter()
     filename = file.filename or ""
 
-    chunking = _chunking_params(chunk_size, overlap, table_chunk_size, threshold)
+    chunking = _chunking_params(
+        chunk_size, overlap, table_chunk_size, threshold, header_threshold
+    )
     chunk_size = chunking["chunk_size"]
     overlap = chunking["overlap"]
     table_chunk_size = chunking["table_chunk_size"]
     threshold = chunking["threshold"]
+    header_threshold = chunking["header_threshold"]
 
     data = await file.read()
     if len(data) > settings.max_file_size_bytes:
@@ -164,9 +180,9 @@ async def parse_document(
 
     try:
         validate_upload(filename, data)
-        parser = get_parser(filename)
+        parser = get_parser(filename, header_threshold=header_threshold)
     except UnsupportedFormatError as exc:
-        raise _error(400, exc.message, "unsupported_format") from exc
+        raise _error(422, exc.message, "unsupported_format") from exc
     except FileTooLargeError as exc:
         raise _error(413, exc.message, "file_too_large") from exc
     except DocumentError as exc:
@@ -185,11 +201,20 @@ async def parse_document(
             table_chunk_size=table_chunk_size,
         )
         if chunker is not None:
-            result.chunks = chunker.chunk(
-                result.markdown, {"source": filename, "format": result.format}
-            )
+            from rag_parser.chunkers.hybrid import HybridRagChunker
+
+            if isinstance(chunker, HybridRagChunker) and result.tree is not None:
+                result.chunks = chunker.chunk(
+                    result.markdown,
+                    {"source": filename, "format": result.format},
+                    tree=result.tree,
+                )
+            else:
+                result.chunks = chunker.chunk(
+                    result.markdown, {"source": filename, "format": result.format}
+                )
     except UnsupportedFormatError as exc:
-        raise _error(400, exc.message, "unsupported_format") from exc
+        raise _error(422, exc.message, "unsupported_format") from exc
     except DocumentParseError as exc:
         raise _error(400, exc.message, "parse_error") from exc
     except ValueError as exc:
@@ -201,6 +226,13 @@ async def parse_document(
         temp_path.unlink(missing_ok=True)
 
     response = _result_to_response(result)
+    from rag_parser.parsers.dedoc_tree import truncate as _truncate
+
+    stored_tree = (
+        _truncate(result.tree, settings.TREE_TEXT_PREVIEW_LEN).to_dict()
+        if result.tree is not None
+        else None
+    )
     document_store.add(
         {
             "document_id": result.document_id,
@@ -209,6 +241,7 @@ async def parse_document(
             "markdown": result.markdown,
             "metadata": result.metadata,
             "chunks": [chunk.to_dict() for chunk in result.chunks or []],
+            "tree": stored_tree,
         }
     )
     logger.info(
@@ -222,111 +255,13 @@ async def parse_document(
     return response
 
 
-@router.post(
-    "/parse_dedoc",
-    response_model=ParseResponse,
-    responses={
-        400: {"model": ErrorResponse},
-        413: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
-    },
-)
-async def parse_document_dedoc(
-    file: UploadFile = File(...),
-    chunking_type: ChunkingType = Form(ChunkingType.NONE),
-    chunk_size: Optional[int] = Form(None),
-    overlap: Optional[int] = Form(None),
-    table_chunk_size: Optional[int] = Form(None),
-    threshold: Optional[float] = Form(None),
-) -> ParseResponse:
-    """Parses a DOCX with dedoc and stores the tree and Markdown on disk.
-
-    Two files are written to ``output/dedoc_results/`` and their paths are
-    returned in ``metadata.raw_tree_path`` / ``metadata.markdown_path``.
-    """
-    started = time.perf_counter()
-    filename = file.filename or ""
-
-    chunking = _chunking_params(chunk_size, overlap, table_chunk_size, threshold)
-    chunk_size = chunking["chunk_size"]
-    overlap = chunking["overlap"]
-    table_chunk_size = chunking["table_chunk_size"]
-    threshold = chunking["threshold"]
-
-    extension = Path(filename).suffix.lower()
-    if extension not in DEDOC_EXTENSIONS:
-        raise _error(
-            400,
-            f"Unsupported file format: {extension!r}. "
-            f"Supported: {', '.join(DEDOC_EXTENSIONS)}",
-            "unsupported_format",
-        )
-
-    data = await file.read()
-    if len(data) > settings.max_file_size_bytes:
-        raise _error(
-            413,
-            f"File exceeds limit of {settings.MAX_FILE_SIZE_MB} MB",
-            "file_too_large",
-        )
-    if not data:
-        raise _error(400, "Uploaded file is empty", "invalid_file")
-
-    temp_path = save_upload(filename, data)
-    try:
-        result = DedocParser().parse(temp_path)
-        result.filename = filename
-        chunker = get_chunker(
-            ChunkingType(chunking_type),
-            chunk_size,
-            overlap,
-            source=filename,
-            threshold=threshold,
-            table_chunk_size=table_chunk_size,
-        )
-        if chunker is not None:
-            result.chunks = chunker.chunk(
-                result.markdown, {"source": filename, "format": result.format}
-            )
-    except DocumentParseError as exc:
-        raise _error(400, exc.message, "parse_error") from exc
-    except ValueError as exc:
-        raise _error(400, str(exc), "invalid_params") from exc
-    except Exception as exc:  # noqa: BLE001 - last resort guard
-        logger.exception("Failed to parse %s with dedoc", filename)
-        raise _error(500, f"Parsing failed: {exc}", "internal_error") from exc
-    finally:
-        temp_path.unlink(missing_ok=True)
-
-    response = _result_to_response(result)
-    document_store.add(
-        {
-            "document_id": result.document_id,
-            "filename": result.filename,
-            "format": result.format,
-            "markdown": result.markdown,
-            "metadata": result.metadata,
-            "chunks": [chunk.to_dict() for chunk in result.chunks or []],
-        }
-    )
-    logger.info(
-        "parsed %s with dedoc chunks=%d chars=%d tree=%s elapsed=%.3fs",
-        filename,
-        len(result.chunks or []),
-        len(result.markdown),
-        result.metadata.get("raw_tree_path"),
-        time.perf_counter() - started,
-    )
-    return response
-
-
 @router.get(
     "/parse/{document_id}/download",
     responses={200: {"content": {"application/octet-stream": {}}}, 404: {}},
 )
 async def download_document(
     document_id: str,
-    format: str = Query("md", pattern="^(md|json)$"),
+    format: str = Query("md", pattern="^(md|json|tree)$"),
 ) -> Response:
     document = document_store.get(document_id)
     if document is None:
@@ -341,6 +276,7 @@ async def download_document(
                 "markdown": document["markdown"],
                 "metadata": document["metadata"],
                 "chunks": document["chunks"],
+                "tree": document.get("tree"),
             },
             option=orjson.OPT_INDENT_2,
         )
@@ -350,6 +286,21 @@ async def download_document(
             headers={
                 "Content-Disposition": (
                     f"attachment; filename*=UTF-8''{quote(document['filename'])}.json"
+                )
+            },
+        )
+
+    if format == "tree":
+        payload = orjson.dumps(
+            document.get("tree") or {},
+            option=orjson.OPT_INDENT_2,
+        )
+        return Response(
+            content=payload,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": (
+                    f"attachment; filename*=UTF-8''{quote(document['filename'])}.tree.json"
                 )
             },
         )

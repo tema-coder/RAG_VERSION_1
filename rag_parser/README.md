@@ -1,58 +1,69 @@
-# Парсер документов с чанкингом
+# Парсер документов с чанкингом (dedoc-only)
 
-Бэкенд-сервис на Python для парсинга документов различных форматов в Markdown
-с опциональным чанкингом, плюс минимальный веб-интерфейс на Streamlit для
-загрузки и скачивания результатов.
+Бэкенд-сервис на Python: парсинг 9 форматов в Markdown через **единственный
+парсер `DedocParser` (dedoc)** со структурным деревом документа,
+breadcrumb-обогащением чанков и эвристикой визуальных заголовков, плюс
+Streamlit UI.
 
 Архитектура: модульный монолит. Только CPU, без OCR, без векторной БД,
 без аутентификации (MVP), синхронный парсинг.
 
 ## Возможности
 
-- 8 форматов: PDF, DOCX, HTML, TXT/MD (через `markitdown`), XLSX/XLS (собственный парсер на `python-calamine` с поддержкой объединённых ячеек) и CSV (собственный парсер).
-- Таблицы из XLSX конвертируются в валидные Markdown-таблицы, листы разделяются заголовками `## Лист: {название}`.
-- Гибридный чанкинг на `chonkie`: таблицы всегда чанятся `TableChunker` (два представления — Markdown для LLM и естественный язык для эмбеддинга), текст — на выбор `token` / `sentence` / `semantic` / `recursive`.
-- Отдельный парсер `DedocParser` (`dedoc`) для DOCX: строит дерево документа с иерархией заголовков и таблицами, сохраняет сырое дерево (JSON) и Markdown на диск.
+- 9 форматов через dedoc: `.docx`, `.xlsx`, `.xls`, `.pdf` (только текстовый
+  слой), `.html`, `.htm`, `.txt`, `.csv`, `.tsv`. Неподдерживаемые (`.doc`,
+  `.odt`, сканы) → `422`.
+- Структурное дерево `DocumentNode` в ответе API (урезанное превью для
+  отображения) и во вкладке UI.
+- Breadcrumb-обогащение: `text_for_embedding = "[Раздел 2 > 2.3 ...] текст"`;
+  у таблиц префикс в обоих представлениях.
+- Header promotion для документов без стилей Word (жирные/нумерованные
+  заголовки) с настраиваемым порогом — слайдер в UI и параметр API.
+- Forward-fill объединённых ячеек xlsx/xls.
+- Гибридный чанкинг на `chonkie`: таблицы — `TableChunker` (Markdown для LLM +
+  естественный язык для эмбеддинга), текст — `token` / `sentence` /
+  `semantic` / `recursive`.
 - REST API (FastAPI) и Streamlit UI.
-- Логирование операций (structlog, уровень INFO+), конфигурация через ENV.
 
 ## Требования
 
-- Python 3.10–3.12 (проект собран и протестирован на 3.12).
+- Python **3.10–3.11** (собрано и протестировано на 3.10.21; 3.12 не
+  использовать — у dedoc нет wheels для его пинов).
 - Системная библиотека `libmagic` (для `python-magic`, проверка типа файла).
+- Java/tesseract **не нужны**: PDF читается только с текстовым слоем
+  (`pdf_with_text_layer=true`), OCR и image-ридеры исключены из конфига
+  менеджера (см. «Отклонения»).
 
 ## Установка
 
 ```bash
-python3.12 -m venv .venv
+python3.10 -m venv .venv
 source .venv/bin/activate
-pip install -r rag_parser/requirements.txt
+# 1. Сначала torch CPU-only (ТЗ: только CPU; с дефолтного индекса pip
+#    тянет CUDA-сборку ~1.2 ГБ с nvidia-зависимостями):
+pip install "torch==2.14.1+cpu" --index-url https://download.pytorch.org/whl/cpu
+# 2. Остальное с фиксацией версий:
+pip install -r rag_parser/requirements.txt -c constraints.txt
+python -c "from dedoc import DedocManager; print('dedoc OK')"
+python -c "import chonkie; print(chonkie.__version__)"
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# ожидаемое: 2.14.1+cpu False, каталог torch ~750 МБ (CUDA — 1.2+ ГБ)
 ```
 
-Опционально — парсер `dedoc` (`POST /api/parse_dedoc`, `DedocParser`). Он
-ставится **без зависимостей** dedoc: его собственные пины конфликтуют с
-`fastapi==0.115.0`, а `opencv-python`/`scipy`/`scikit-image`/`scikit-learn`
-не имеют wheels для Python 3.12 (см. «Отклонения от ТЗ»).
+Воспроизводимость: `torch` — транзитивная зависимость (dedoc,
+`sentence-transformers`), поэтому в `requirements.txt` он не пиннится (прямой
+пин ломает резолвер), а фиксируется через `constraints.txt`
+(`pip freeze` минус CUDA-пакеты `nvidia-*`/`triton`/`cuda-*`;
+`torch==2.14.1` — без local-тега, сборку `+cpu`/`+cu130` выбирает индекс).
+Порядок важен: предустановленный `+cpu` резолвер принимает как выполненное
+требование и не переустанавливает (`Requirement already satisfied` в логе).
+Без шага 1 constraints воспроизведёт CUDA на любой машине.
 
-```bash
-pip install --no-deps dedoc==2.8
-pip install -r rag_parser/requirements-dedoc.txt
-```
-
-`torch` нужен dedoc для вложенных вложений (только CPU-сборка):
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
-
-Без dedoc сервис работает полностью, кроме `/api/parse_dedoc` и тестов
-`DedocParser` (они помечаются `skip`).
-
-Проверка зависимостей:
-
-```bash
-pip check
-```
+Зафиксированные версии (пины продиктованы конфликтами зависимостей dedoc,
+см. «Отклонения»): `dedoc==2.8`, `fastapi==0.104.1`, `uvicorn==0.23.2`,
+`python-multipart==0.0.6`, `python-docx==0.8.11`, `chonkie==1.3.1`,
+`httpx==0.27.2`, `numpy==1.26.4`, `scipy==1.11.2`. Остальное — как было
+(`streamlit==1.38.0`, `tiktoken==0.7.0` и т.д.).
 
 ## Запуск API
 
@@ -62,13 +73,7 @@ pip check
 uvicorn rag_parser.main:app --reload --port 8000
 ```
 
-Из каталога `rag_parser/`:
-
-```bash
-uvicorn main:app --reload --port 8000
-```
-
-Swagger UI: <http://localhost:8000/docs>, ReDoc: <http://localhost:8000/redoc>.
+Swagger UI: <http://localhost:8000/docs>.
 
 ## Запуск UI
 
@@ -76,13 +81,9 @@ Swagger UI: <http://localhost:8000/docs>, ReDoc: <http://localhost:8000/redoc>.
 streamlit run rag_parser/frontend/app.py
 ```
 
-Или из каталога `rag_parser/`:
-
-```bash
-streamlit run frontend/app.py
-```
-
-UI работает без запущенного API: парсеры и чанкеры вызываются напрямую.
+UI работает без запущенного API: парсер и чанкеры вызываются напрямую.
+Слайдер «Порог распознавания заголовков» (0.0–8.0, default 4.0) + кнопка
+«Перепарсить» — повторный разбор с новым порогом без перезагрузки файла.
 
 ## Конфигурация
 
@@ -95,241 +96,160 @@ UI работает без запущенного API: парсеры и чан�
 | `DEFAULT_OVERLAP`     | 50           | Перекрытие чанков по умолчанию, токенов     |
 | `DEFAULT_TABLE_CHUNK_SIZE` | 5       | Строк данных на табличный чанк              |
 | `SEMANTIC_MODEL_NAME` | deepvk/USER-bge-m3 | Модель эмбеддингов для semantic-чанкинга |
+| `SEMANTIC_THRESHOLD`  | 0.5          | Порог semantic-чанкинга                     |
+| `HEADER_PROMOTION_THRESHOLD` | 4.0   | Порог промоции визуальных заголовков        |
+| `BREADCRUMB_MAX_DEPTH`| 3            | Глубина крошки (берутся последние N уровней)|
+| `TREE_TEXT_PREVIEW_LEN` | 30         | Длина превью текста узла дерева             |
 | `TEMP_DIR`            | ./temp       | Каталог для временных файлов                |
 | `DEDOC_OUTPUT_DIR`    | rag_parser/output/dedoc_results | Каталог для результатов dedoc |
 | `LOG_LEVEL`           | INFO         | Уровень логирования                         |
 | `DOC_STORE_MAX_ITEMS` | 64           | Сколько результатов хранить в памяти        |
-| `SUPPORTED_EXTENSIONS`| .pdf,...     | Список поддерживаемых расширений            |
+| `SUPPORTED_EXTENSIONS`| .docx,...    | Список поддерживаемых расширений (9)        |
 
 ## Поддерживаемые форматы
 
-| Формат | Расширения         | Парсер             | Особенности                                                     |
-|--------|--------------------|--------------------|-----------------------------------------------------------------|
-| PDF    | `.pdf`             | MarkItDownParser   | Текст всех страниц, таблицы — в виде Markdown-таблиц            |
-| XLSX   | `.xlsx`, `.xls`    | XlsxParser         | `CalamineWorkbook`: все листы под заголовком `## Лист: {название}`, объединённые ячейки заполняются (forward-fill) |
-| DOCX   | `.docx`            | MarkItDownParser   | Структура, заголовки, таблицы                                   |
-| DOCX   | `.docx`            | DedocParser        | Только `POST /api/parse_dedoc`: дерево документа + Markdown на диск |
-| HTML   | `.html`, `.htm`    | MarkItDownParser   | Заголовки h1–h6, таблицы, ссылки                                |
-| TXT/MD | `.txt`, `.md`      | MarkItDownParser   | Определение кодировки charset-normalizer                         |
-| CSV    | `.csv`, `.tsv`     | CsvParser          | Собственный парсер: автодетект разделителя, стабильные таблицы  |
+| Формат | Расширения   | Как обрабатывается                                              |
+|--------|--------------|-----------------------------------------------------------------|
+| DOCX   | `.docx`      | `DocxReader` dedoc напрямую (`DedocManager.parse`)              |
+| XLSX   | `.xlsx`      | `ExcelReader` dedoc напрямую — единственный парсер, без обёрток |
+| XLS    | `.xls`       | Конвертация xlrd→openpyxl внутри `DedocParser`, далее как xlsx  |
+| PDF    | `.pdf`       | `pdf_with_text_layer=true`; без текстового слоя → 400 «OCR отключён» |
+| HTML   | `.html`, `.htm` | `HtmlReader` dedoc напрямую                                  |
+| TXT    | `.txt`       | `RawTextReader` dedoc напрямую                                  |
+| CSV/TSV| `.csv`, `.tsv` | `CSVReader` dedoc напрямую + явные `delimiter`/`encoding=utf-8` |
 
-Сканированные PDF (без текстового слоя) не поддерживаются — OCR не используется.
-PPTX, медиафайлы и архивы сознательно не поддерживаются: расширения из этого
-списка отклоняются с ошибкой 400.
+`.xlsx` идёт в dedoc без посредников (тест `test_xlsx_goes_through_dedoc_without_conversion`
+проверяет, что `DedocManager.parse` вызван, а конвертация не запускается, —
+защита от будущего увода xlsx мимо dedoc при рефакторинге).
 
-Метаданные от `MarkItDownParser`: `format`, `extension`, `size_bytes`, `lines`,
-`characters`, `converter`. У CSV дополнительно: `rows`, `columns`, `delimiter`,
-`header`. Значение `pages` в ответе API всегда `null` (см. отклонения).
+`.xls` конвертируется потому, что dedoc обрабатывает legacy BIFF только через
+LibreOffice: `ExcelConverter.convert` выполняет
+`soffice --headless --convert-to xlsx`, который исключён ограничениями.
+Без конвертации разбор падает с точной ошибкой:
+
+```
+DocumentParseError: dedoc failed to parse the document:
+[Errno 2] No such file or directory: 'soffice'
+```
+
+Конвертация — внутри единого фасада `DedocParser` (отдельного парсера нет),
+только CPU. Объединённые диапазоны переносятся (`xlrd` отдаёт
+`sheet.merged_cells` только с `formatting_info=True`, есть в BIFF8; в старых
+BIFF5 список может быть пуст — тогда для xls работает эвристический
+forward-fill).
+
+Сканированные PDF (без текстового слоя) не поддерживаются — OCR отключён.
+PDF-таблицы в CPU-окружении без Java/tesseract извлекаются текстом (без
+структурированных MD-таблиц): `tabby`-ридер требует Java, pdfminer-ридер —
+tesseract для анализа таблиц. Табличные чанки гарантированы для
+docx/xlsx/csv.
+
+## Дерево документа
+
+`POST /api/parse` возвращает `tree: TreeNode` (pydantic-рекурсия:
+`type/level/text/children/metadata`):
+
+- типы: `document | header | paragraph | list_item | table | raw_text`;
+- заголовки dedoc называются `header` (значение `heading` нормализуется);
+- `text` — **урезанное превью**: первые `TREE_TEXT_PREVIEW_LEN` (30) символов
+  + `…`, только для отображения во фронтенде;
+- в `metadata` только `annotations_count` — аннотации целиком не дублируются
+  (плюс служебные счётчики `toc_suppressed`, `paren_suppressed`,
+  `orphan_tables`);
+- полные тексты живут в `.md` и `raw_dedoc_tree_{doc_id}.json`;
+- **чанкинг всегда работает по полным текстам**: Markdown собирается из
+  полного дерева, урезание применяется последним шагом перед отдачей в API/UI.
+
+Таблицы стоят в дереве на месте из исходника, а не в конце: dedoc вешает на
+абзац перед таблицей `TableAnnotation(name="table", value=<uid таблицы>)`,
+парсер вставляет таблицу первым ребёнком якоря (до промоции якорь с ребёнком
+не режется — привязка выполняется строго после промоции, `reattach_tables`;
+аннотации переживают split/merge со пересчётом оффсетов). Без аннотации
+(Excel/CSV, дубли, неизвестный uid) — append в конец + warning и счётчик
+`orphan_tables` (поведение самого dedoc: его `json2md` делает так же).
+
+На диске (`DEDOC_OUTPUT_DIR`): `raw_dedoc_tree_{id}.json` (сырой JSON dedoc)
+и `parsed_{id}.md`. Скачивание: `?format=md|json|tree` (`tree` — урезанное
+дерево).
+
+## Breadcrumb-обогащение
+
+Путь заголовков от корня до родителя узла, разделитель `" > "`, берутся
+**последние** `BREADCRUMB_MAX_DEPTH` (3) уровней — ближайшие заголовки несут
+больше смысла для эмбеддинга. Если путь короче — берётся весь; без
+заголовков — `breadcrumb = None`, обогащение не применяется.
+
+- текстовые чанки: `text_for_embedding = "[Раздел 2 > 2.3 ...] текст"`;
+- табличные чанки: `[breadcrumb]` в начале **обоих** представлений (`text` и
+  `text_for_embedding`); NL-представление не содержит `|`.
+
+## Header promotion
+
+Документы без стилей Word (жирные/крупные/центрированные «Раздел N.»)
+получают заголовки эвристикой до генерации Markdown и чанкинга:
+
+| Признак | Баллы |
+|---|---|
+| Regex `^(Раздел\s+\d+\.?|\d+(\.\d+)*\.?)(\s|$)` или `^\d+\)` | +4 явный «Раздел N», иначе +3; level из нумерации (см. ниже) |
+| `bold=True` | +2 |
+| `size > 14` | +1.5 |
+| КАПС | +1 |
+| Длина < 100 | +1 |
+| `alignment=center` | +0.5 |
+| Предложение с точкой длиннее 120 | −2 |
+
+Уровень из нумерации: точки считаются только между цифрами («Раздел 2.» → 1,
+«2.» → 1, «2.3» → 2, «2.3.1» → 3); ветка `N)` — подчинённый уровень 2.
+Отклонение от исходной шкалы (+3): явный «Раздел N» даёт +4 — длинные титулы
+секций иначе не добирали балл и их таблицы приписывались предыдущему разделу
+(проверено на годовом отчёте).
+
+Порог — `HEADER_PROMOTION_THRESHOLD` (4.0), переопределяется параметром API
+`header_threshold` и слайдером UI. Многострочные узлы предварительно режутся
+на строки (аннотации пересчитываются по диапазонам), затем абзацы склеиваются
+обратно. Финал — глобальный ребилд: дерево сплющивается в порядок документа
+и пересобирается стеком по уровням, поэтому промоутнутый заголовок всплывает
+из чужой dedoc-вложенности (lift) вместо погребения в ней.
+
+Два doc-level правила (считаются до скоринга, в `tree.metadata` — счётчики
+`toc_suppressed` / `paren_suppressed`):
+- **Супрессия `N)`**: при ≥2 distinct «Раздел N» в документе строки вида
+  `N)` не промоутятся вовсе (это пункты перечня, а не заголовки; префикс
+  `N)` ставит сам dedoc из автонумерации Word — `numbering.xml, lvlText=%1)`).
+  Без «Раздел N» поведение прежнее. Абсолютна: не зависит от порога.
+- **TOC-серии**: ≥5 подряд идущих «Раздел N» с N строго +1 (оглавление)
+  остаются paragraph поштучно, иначе абзацы между TOC и телом получали бы
+  ложный breadcrumb от последней строки оглавления.
 
 ## Типы чанкинга
 
-Гибридная модель: при любом типе (кроме `none`) документ сначала делится на
-блоки по пустым строкам, затем **табличные блоки всегда чанятся
-`TableChunker`** (заголовок таблицы прикрепляется к каждому чанку), а
-текстовые — выбранной стратегией.
-
 | Тип        | Текстовая стратегия (`chonkie`) | Параметры |
 |------------|---------------------------------|-----------|
-| `none`     | —                               | Текст возвращается целиком, `chunks = null` |
+| `none`     | —                               | `chunks = null` |
 | `fixed`    | `TokenChunker` (`cl100k_base`)  | `chunk_size` (200), `overlap` (50) |
-| `sentence` | `SentenceChunker`               | `chunk_size` (200), предложения не разрываются |
+| `sentence` | `SentenceChunker`               | `chunk_size` (200) |
 | `semantic` | `SemanticChunker`               | `chunk_size` (200), `threshold` (0.5) |
-| `recursive`| `RecursiveChunker`              | `chunk_size` (200), `overlap` (20), иерархия разделителей |
+| `recursive`| `RecursiveChunker`              | `chunk_size` (200), `overlap` (20) |
 
-### Рекурсивный чанкинг
-
-`RecursiveChunker` (`chunkers/recursive.py`) рекурсивно спускается по иерархии
-разделителей и берёт первый уровень, на котором фрагмент помещается в
-`chunk_size`:
-
-```
-"\n\n"  →  "\n"  →  ". "  →  " "   (абзац → строка → предложение → слово)
-```
-
-Значения по умолчанию: `chunk_size=200`, `chunk_overlap=20`, разделители
-`["\n\n", "\n", ". ", " "]`. Разделители-Whitespace нельзя передать в chonkie
-как delimiters, поэтому `" "` превращается в отдельный уровень
-`RecursiveLevel(whitespace=True)`.
-
-`chunk_overlap` в `chonkie.RecursiveChunker` **отсутствует**, поэтому хвост
-предыдущего чанка (последние `overlap` токенов `cl100k_base`) добавляется в
-начало следующего в обёртке. Из-за этого чанк может превышать `chunk_size` на
-`overlap` токенов — так же ведут себя и остальные чанкеры.
-
-```bash
-curl -X POST http://localhost:8000/api/parse \
-  -F "file=@report.pdf" \
-  -F "chunking_type=recursive" \
-  -F "chunk_size=500" \
-  -F "overlap=50"
-```
-
-Табличные чанки (`metadata.chunk_type == "table"`) несут два представления:
-`text` — оригинальный Markdown с `|` (для контекста LLM) и
-`text_for_embedding` — естественный язык вида `Заголовок: значение, ...`
-(для эмбеддинга). Размер табличного чанка — `table_chunk_size` (5) строк
-данных. У текстовых чанков `text_for_embedding = null`.
-
-`chunk_size` — 100…2000 токенов, `overlap` — 0…500 (и всегда меньше `chunk_size`),
-`table_chunk_size` — 1…50, `threshold` — строго между 0 и 1.
-
-Семантический чанкер использует модель `deepvk/USER-bge-m3` (переопределяется
-через `SEMANTIC_MODEL_NAME`, указывается без префикса провайдера).
-**Внимание:** при первом запуске модель скачивается с Hugging Face Hub
-(~2 ГБ), нужен интернет; работает на CPU. Тесты для semantic-чанкера
-помечены `@pytest.mark.slow` и пропускаются без сети.
+`chunk_size` — 100…2000, `overlap` — 0…500 (< `chunk_size`), `table_chunk_size`
+— 1…50, `threshold` — строго (0, 1), `header_threshold` — 0…8.
+Семантический чанкер тянет модель с Hugging Face (~2 ГБ), нужен интернет.
 
 ## Примеры использования API
-
-Проверка состояния:
-
-```bash
-curl http://localhost:8000/api/health
-```
-
-Список форматов и лимитов:
-
-```bash
-curl http://localhost:8000/api/formats
-```
-
-Парсинг без чанкинга:
 
 ```bash
 curl -X POST http://localhost:8000/api/parse \
   -F "file=@report.pdf" \
   -F "chunking_type=none"
-```
 
-Парсинг с фиксированным чанкингом:
-
-```bash
 curl -X POST http://localhost:8000/api/parse \
-  -F "file=@report.pdf" \
-  -F "chunking_type=fixed" \
-  -F "chunk_size=500" \
-  -F "overlap=50"
-```
-
-Семантический чанкинг:
-
-```bash
-curl -X POST http://localhost:8000/api/parse \
-  -F "file=@report.pdf" \
-  -F "chunking_type=semantic" \
-  -F "chunk_size=800" \
-  -F "overlap=100"
-```
-
-Скачивание результата (по `document_id` из ответа):
-
-```bash
-curl -OJ "http://localhost:8000/api/parse/<document_id>/download?format=md"
-curl -OJ "http://localhost:8000/api/parse/<document_id>/download?format=json"
-```
-
-### Парсинг через dedoc: `POST /api/parse_dedoc`
-
-`dedoc` разбирает DOCX в дерево узлов (заголовки сохраняют уровень, таблицы
-выносятся в отдельные структуры с `rowspan`/`colspan`), после чего дерево
-рендерится в Markdown. Оба артефакта сохраняются на диск, их пути возвращаются
-в `metadata`.
-
-| Файл на диске                       | Содержимое                        |
-|-------------------------------------|-----------------------------------|
-| `raw_dedoc_tree_{document_id}.json` | сырое дерево dedoc (JSON, indent 2) |
-| `parsed_markdown_{document_id}.md`  | итоговый Markdown                 |
-
-Каталог — `DEDOC_OUTPUT_DIR` (по умолчанию `rag_parser/output/dedoc_results/`,
-создаётся автоматически).
-
-```bash
-curl -X POST http://localhost:8000/api/parse_dedoc \
-  -F "file=@complex_structured.docx"
-```
-
-С чанкингом (параметры те же, что у `/api/parse`):
-
-```bash
-curl -X POST http://localhost:8000/api/parse_dedoc \
   -F "file=@complex_structured.docx" \
   -F "chunking_type=recursive" \
-  -F "chunk_size=300" \
-  -F "overlap=30"
-```
+  -F "chunk_size=500" \
+  -F "overlap=50" \
+  -F "header_threshold=2.0"
 
-Пример ответа (фрагмент):
-
-```json
-{
-  "document_id": "9a1f...",
-  "filename": "complex_structured.docx",
-  "format": "dedoc",
-  "markdown": "# **Техническое задание ...**",
-  "chunks": null,
-  "metadata": {
-    "parser": "dedoc",
-    "dedoc_version": "2.8",
-    "tables": 2,
-    "raw_tree_path": "/.../output/dedoc_results/raw_dedoc_tree_9a1f....json",
-    "markdown_path": "/.../output/dedoc_results/parsed_markdown_9a1f....md",
-    "output_dir": "/.../output/dedoc_results"
-  }
-}
-```
-
-Тот же парсер доступен из Python:
-
-```python
-from pathlib import Path
-
-from rag_parser.parsers.dedoc_parser import DedocParser
-
-result = DedocParser().parse(Path("rag_parser/test_data/complex_structured.docx"))
-print(result.markdown)
-print(result.metadata["raw_tree_path"], result.metadata["markdown_path"])
-```
-
-Эндпоинт принимает только `.docx`; остальные расширения и битые файлы дают 400.
-
-### Генерация тестового документа
-
-```bash
-python rag_parser/scripts/generate_test_doc.py
-# generated: .../rag_parser/test_data/complex_structured.docx (38 KB)
-```
-
-Скрипт (на `python-docx`) собирает эталонный документ: вложенные заголовки
-H1–H3, многоуровневые маркированные и нумерованные списки, таблицы с
-объединёнными по горизонтали и вертикали ячейками, многоуровневой шапкой и
-вложенным списком внутри ячейки. Путь можно переопределить:
-
-```bash
-python rag_parser/scripts/generate_test_doc.py --output /tmp/my_doc.docx
-```
-
-Тесты используют этот же файл и создают его сами, если он отсутствует.
-
-Пример ответа:
-
-```json
-{
-  "document_id": "9a1f...",
-  "filename": "report.pdf",
-  "format": "pdf",
-  "pages": 10,
-  "markdown": "## Страница 1\n...",
-  "chunks": [
-    {
-      "index": 0,
-      "text": "Текст чанка...",
-      "tokens": 480,
-      "source": "report.pdf",
-      "metadata": {"chunker": "fixed", "start_token": 0, "end_token": 500}
-    }
-  ],
-  "metadata": {"pages": 10, "tables": 1, "tables_detail": []}
-}
+curl -OJ "http://localhost:8000/api/parse/<document_id>/download?format=tree"
 ```
 
 ### HTTP-коды
@@ -337,178 +257,102 @@ python rag_parser/scripts/generate_test_doc.py --output /tmp/my_doc.docx
 | Код  | Случай                                                            |
 |------|-------------------------------------------------------------------|
 | 200  | Успех                                                             |
-| 400  | Неподдерживаемый формат, битый файл, неверные параметры чанкинга |
-| 404  | `document_id` не найден при скачивании                            |
+| 400  | Битый файл, неверные параметры чанкинга                           |
+| 404  | `document_id` не найден; удалённый `/api/parse_dedoc`             |
 | 413  | Файл больше `MAX_FILE_SIZE_MB`                                    |
+| 422  | Неподдерживаемый формат (`.doc`, `.odt`, `.exe`, …)               |
 | 500  | Непредвиденная ошибка сервера                                     |
-
-Тип ошибки дополнительно отдаётся в заголовке `X-Error-Type`
-(`invalid_params`, `unsupported_format`, `parse_error`, `file_too_large`,
-`not_found`, `internal_error`).
 
 ## Тесты
 
 ```bash
 python -m pytest
-```
-
-Покрытие парсеров и чанкеров:
-
-```bash
 python -m pytest --cov=rag_parser.parsers --cov=rag_parser.chunkers --cov-fail-under=80
 ```
 
-Тесты сами генерируют тестовые файлы всех форматов во временном каталоге:
-`.docx` и `.xlsx` — через python-docx и openpyxl, PDF — небольшим собственный
-генератором без внешних зависимостей (встроенный шрифт Helvetica, поэтому
-текст в PDF-фикстурах латиницей). Отдельно проверяются битые PDF/DOCX/XLSX,
-пустые файлы, архивы и неподдерживаемые расширения.
-
-Тесты `RecursiveChunker` проверяют иерархию разделителей (абзацы не рвутся,
-предложения сохраняются при маленьком `chunk_size`), соблюдение `chunk_overlap`
-и метаданные чанков. Тесты `DedocParser` и `TestParseDedoc` используют
-`test_data/complex_structured.docx` (создаётся автоматически через
-`scripts/generate_test_doc.py`), перенаправляют `DEDOC_OUTPUT_DIR` во временный
-каталог и проверяют, что на диск записаны `raw_dedoc_tree_*.json` и
-`parsed_markdown_*.md` с `document_id` в имени, а в Markdown есть заголовки и
-таблицы. Без установленного dedoc они пропускаются.
+Покрытие: parsers ~85%, chunkers ~96%. Фикстуры: `.docx`/`.xlsx` — через
+python-docx/openpyxl, `.xls` — предсгенерирован (`test_data/sample.xls`,
+генератор — xlwt), PDF — собственный генератор без зависимостей.
+`test_data/merged_cells.xlsx` — merged-диапазоны (горизонтальные, вертикаль,
+2D-блок), `complex_structured.docx` — эталонный документ (перегенерируется
+скриптом при отсутствии).
 
 ## Структура проекта
 
 ```
 rag_parser/
-├── api/            # FastAPI: схемы, зависимости (фабрики, валидация, хранилище), роуты
-├── parsers/        # MarkItDownParser (pdf, docx, html, txt, md) + XlsxParser + CsvParser + DedocParser
-├── chunkers/       # token, sentence, semantic, recursive, table (chonkie) + hybrid-оркестратор
-├── frontend/       # Streamlit UI
-├── core/           # Настройки (pydantic-settings) и интерфейсы (ABC, Chunk, ParseResult)
-├── scripts/        # Генерация тестового DOCX для dedoc
-├── test_data/      # Сгенерированные тестовые документы
-├── output/         # Результаты dedoc (raw_dedoc_tree_*.json, parsed_markdown_*.md), в .gitignore
-├── tests/          # Тесты парсеров, чанкеров и API
-├── main.py         # Точка входа FastAPI, логирование
+├── api/            # FastAPI: схемы (TreeNode), фабрика DedocParser, роуты
+├── parsers/        # dedoc_parser (единственный) + dedoc_tree + merged_cells + header_promoter
+├── chunkers/       # token, sentence, semantic, recursive, table (chonkie) + hybrid + breadcrumb
+├── frontend/       # Streamlit UI (дерево, слайдер порога, скачивание)
+├── core/           # Настройки и интерфейсы (DocumentNode, Chunk.breadcrumb, ParseResult.tree)
+├── scripts/        # Генерация тестового DOCX
+├── test_data/      # complex_structured.docx, merged_cells.xlsx, sample.xls
+├── output/         # Результаты dedoc (в .gitignore)
+├── tests/          # test_dedoc_tree, test_merged_cells, test_header_promoter, test_breadcrumb, ...
+├── main.py
 ├── requirements.txt
-├── requirements-dedoc.txt
 └── .env.example
 ```
 
+## Миграция с markitdown: что удалено и почему
+
+Удалены `parsers/markitdown_parser.py`, `parsers/xlsx_parser.py` (calamine),
+`parsers/csv_parser.py`, их тесты и фабрики, эндпоинт `/api/parse_dedoc`
+(остался один `/api/parse`), зависимости `markitdown[all]` и
+`python-calamine`. Причины: единый структурный парсер (дерево + таблицы +
+иерархия) вместо трёх «плоских» конвертеров; dedoc отдаёт merged-диапазоны и
+иерархию, которых у конвертеров не было. В коде не осталось упоминаний
+markitdown/calamine (этот раздел — единственное исключение).
+
+Forward-fill merged cells перенесён из старого xlsx-парсера и усилен до точной
+заливки: `DedocParser` читает реальные диапазоны книги (`openpyxl`,
+таблица `i` ↔ лист `i`, размерность сверяется — при несовпадении потабличный
+fallback на эвристику с warning) и копирует значение левой-верхней ячейки во
+все клетки диапазона независимо от направления (вправо/вниз/2D).
+Эвристика «слева, затем сверху» осталась только fallback без доступа к файлу;
+именно она была неточна на вертикальных мёрджах с непустым левым соседом.
+
 ## Отклонения от ТЗ
 
-### Рекурсивный чанкинг и dedoc
-
-1. **`chunkers/recursive.py`.** Обёртка над `chonkie.RecursiveChunker`
-   (`tokenizer="cl100k_base"`). `RecursiveTextSplitter` в chonkie 1.7.0 нет,
-   а API `RecursiveChunker` не имеет `chunk_overlap`, поэтому перекрытие
-   реализовано вручную (хвост из `overlap` токенов предыдущего чанка).
-   Разделитель `" "` нельзя передать как delimiter — он маппится в
-   `RecursiveLevel(whitespace=True)` (`build_rules`). Дефолты зафиксированы в
-   модуле (`200` / `20` / `["\n\n", "\n", ". ", " "]`), а не берутся из
-   `DEFAULT_OVERLAP=50`, как у остальных чанкеров.
-2. **`dedoc` устанавливается без своих зависимостей** (`pip install --no-deps
-   dedoc==2.8` + `requirements-dedoc.txt`). dedoc 2.8 (актуальная стабильная
-   версия; версии 3.x на PyPI нет) пинит `starlette<=0.27.0`,
-   `uvicorn<=0.23.2`, `python-multipart==0.0.6`, `python-docx==0.8.11`, что
-   несовместимо с `fastapi==0.115.0`, и `opencv-python<4.6`,
-   `scipy<=1.11.2`, `scikit-image<=0.21`, `scikit-learn<=1.2.2` — для них нет
-   wheels под Python 3.12, сборка из исходников падает. В
-   `requirements-dedoc.txt` лежат современные аналоги, реально используемые на
-   DOCX-пути (`numpy<2` — ради `streamlit==1.38.0`, `xlrd==1.2.0` — dedoc
-   обращается к `xlrd.xlsx` на уровне класса, `torch` — нужен
-   `docx_attachments_extractor`). Следствие: `pip check` сообщает о
-   несовместимости метаданных dedoc — runtime не затронут.
-3. **`DedocParser` использует `DedocManager` с явным `manager_config`**
-   (`DocxConverter` + `DocxReader` + `DefaultStructureExtractor` +
-   `TreeConstructor`), а не дефолтную конфигурацию: она поднимает все
-   ридеры/конвертеры dedoc, включая ненужные PDF и PPTX. Markdown получается
-   из `dedoc.api.md_out_type.json2md`, «сырой ответ» — `model_dump()` API-схемы
-   dedoc (в dedoc 2.8 нет `ParsedDocument.to_tree()`). В Markdown сохраняется
-   пометка списка (`- •`), а объединённые ячейки таблиц дают строки разной
-   ширины — из-за этого `TableChunkerRAG` может пропускать такие строки при
-   чанкинге. `dedoc` импортируется лениво: без него сервис работает как
-   раньше, а тесты `DedocParser` пропускаются.
-4. **Результаты dedoc пишутся на диск внутри `DedocParser.save_results()`**, а
-   пути возвращаются в `metadata` (`raw_tree_path`, `markdown_path`,
-   `output_dir`) — эндпоинт их только переиспользует. Каталог
-   `DEDOC_OUTPUT_DIR` по умолчанию задан абсолютным путём относительно пакета
-   (`rag_parser/output/dedoc_results`), чтобы результат не зависел от
-   текущего рабочего каталога; в `.gitignore` он исключён.
-5. **`ChunkingType` расширен значением `recursive`**, поэтому
-   `GET /api/formats` возвращает `none, fixed, sentence, semantic, recursive`
-   (обновлён соответствующий тест). Валидация параметров чанкинга вынесена в
-   общий `_chunking_params()` для `/api/parse` и `/api/parse_dedoc` — поведение
-   `/api/parse` не изменилось.
-
-### Миграция чанкеров на `chonkie`
-
-1. **`chonkie==1.7.0` + `sentence-transformers>=3.0` вместо
-   `semantic-chunkers`.** Ручные реализации на `tiktoken`/regex/`ConsecutiveChunker`
-   удалены (`chunkers/fixed_token.py` удалён, `sentence.py`/`semantic.py`
-   переписаны как обёртки над chonkie). Общие tiktoken-хелперы
-   (`count_tokens`, `get_encoding`) переехали в `chunkers/base.py`.
-2. **Новый `chunkers/table.py`.** `TableChunker(tokenizer="row")` прикрепляет
-   заголовок к каждому чанку; предусмотрен fallback с ручной группировкой
-   строк, если установленный chonkie не поддерживает `tokenizer="row"`.
-   Пустые строки-заглушки `| | |` в начале таблицы вычищаются, после
-   promoted-заголовка вставляется свежий разделитель.
-3. **Новый `chunkers/hybrid.py`.** `HybridRagChunker` — оркестратор: сплит по
-   `\n\n+`, табличные блоки → `TableChunkerRAG`, текстовые → выбранная
-   стратегия. Фабрика чанкеров в API возвращает `HybridRagChunker`; тип `NONE`
-   по-прежнему отключает чанкинг. Тип чанка — в
-   `metadata.chunk_type` (`"table"`/`"text"`), NL-представление — в поле
-   `Chunk.text_for_embedding` / `ChunkResponse.text_for_embedding`.
-4. **`SemanticChunker.threshold` в chonkie — строго в (0, 1).** API валидирует
-   `threshold` как `0 < threshold < 1` (иначе 400); в схеме оставлен
-   `Field(0.5, ge=0.0, le=1.0)` для документации диапазона. Параметр chonkie
-   называется `threshold` (не `similarity_threshold`), идентификатор модели —
-   `sentence-transformers/<имя>`. Чанкер создаётся лениво, при первом `chunk()`.
-5. **`httpx==0.28.1`** (было 0.27.2): chonkie требует `httpx>=0.28.1`.
-   `DEFAULT_CHUNK_SIZE` изменён 500 → 200 по ТЗ; добавлен
-   `DEFAULT_TABLE_CHUNK_SIZE=5`, `SEMANTIC_MODEL_NAME`, `SEMANTIC_THRESHOLD`.
-
-### XLSX на `python-calamine`
-
-6. **`XlsxParser` на `CalamineWorkbook`** (`python-calamine==0.3.1`).
-   `.xlsx`/`.xls` убраны из `MarkItDownParser.supported_extensions`, фабрика
-   отдаёт их `XlsxParser`. В calamine 0.3.1 нет API merged-диапазонов,
-   поэтому forward-fill: пустая ячейка наследует значение слева, затем сверху.
-   Горизонтальные мёрджи и строки-заголовки покрыты; вертикальные мёрджи в
-   середине таблицы могут заполняться неточно (ограничение задокументировано).
-
-### Миграция на `markitdown` (сохранено)
-
-1. **`markitdown[all]==0.1.8` вместо отдельных библиотек.** Удалены
-   `mammoth`, `markdownify`, `pdfplumber`, `pymupdf` (часть вернётся
-   транзитивно внутри `markitdown[all]` — это нормально, в `requirements.txt`
-   они больше не перечисляются). `python-calamine` возвращён отдельной строкой
-   для собственного `XlsxParser`. Экстра `[all]` нужна, иначе при конвертации
-   docx/pdf возникает `MissingDependencyException`.
-2. **Пин версии `0.1.8`.** Экстра `[all]` тянет azure/speech/magika-пакеты,
-   которые меняются между релизами; без пина установка не воспроизводима.
-3. **`.xlsm` больше не поддерживается.** Поддерживаемые расширения:
-   `.pdf`, `.docx`, `.html`, `.htm`, `.txt`, `.md` (markitdown),
-   `.xlsx`, `.xls` (собственный `XlsxParser`), `.csv`, `.tsv` (собственный `CsvParser`).
-4. **Потеряны метаданные `pages`, `tables`, `sheets`, `headings`.** markitdown
-   отдаёт только текст, поэтому в ответе API `pages` всегда `null`, а таблицы
-   присутствуют в Markdown, но без координат и номеров.
-5. **Разделители страниц `## Страница N` и метки `[ТАБЛИЦА N]` убраны** —
-   это разметка предыдущего парсера. Символы перевода страниц (`\f`)
-   нормализуются в пустые строки.
-6. **Добавлена проверка сигнатуры файла.** При битом `.docx`/`.pdf`
-   markitdown молча переключается на конвертер простого текста и возвращает
-   «мусор» из бинарника как Markdown. `MarkItDownParser` проверяет заголовок
-   файла (`PK`, `%PDF`) и отклоняет файл с понятной ошибкой 400.
-7. **PyMuPDF убран и из тестовых фикстур.** PDF для тестов генерируется
-   небольшим собственным генератором (~60 строк) без внешних зависимостей.
-
-### Прочие отклонения (сохранены с прошлых версий)
-
-7. **Добавлены `tqdm`, `pytest-cov`, `openpyxl`, `python-docx` и ограничение
-   `pydantic<3`.** `pytest-cov` нужен для проверки покрытия, `openpyxl`/`python-docx` —
-   для генерации тестовых файлов.
-8. **`rag_parser/__init__.py` добавлен** (в дереве ТЗ отсутствует) — необходим для
-   импортов вида `rag_parser.api.routes`.
-9. **Хранилище результатов — в памяти** (`DocumentStore`, LRU на 64 документа, без БД),
-   чтобы работал `GET /api/parse/{document_id}/download`. Результаты не переживают
-   перезапуск процесса.
-10. **Ошибки валидации запроса возвращают 400, а не 422** (единый код «неверные
-    параметры» по ТЗ).
+1. **Даунгрейды ради установки dedoc** (согласованы): `fastapi 0.115.0 →
+   0.104.1` (`starlette>=0.37` vs `starlette<=0.27` у dedoc 2.8 — единственной
+   версии на PyPI, новее нет), `uvicorn 0.30.6 → 0.23.2`,
+   `python-multipart 0.0.9 → 0.0.6`, `python-docx → 0.8.11` (только фикстуры),
+   `chonkie 1.7.0 → 1.3.1` (`numpy>=2` vs `scipy<=1.11.2 → numpy<1.28`),
+   `httpx 0.28.1 → 0.27.2` (TestClient starlette 0.27). Обёртки чанкеров
+   адаптированы: в 1.3.x первый аргумент называется
+   `tokenizer_or_token_counter` (передаём позиционно),
+   `TableChunker(tokenizer="row")` в 1.3.x нет — работает штатный fallback с
+   ручной группировкой строк. Поведение стратегий и тестов сохранено.
+2. **`DedocManager` с урезанным `manager_config`** (а не дефолтным): дефолт
+   поднимает `PdfImageReader` (torchvision, OCR) — запрещено ограничениями.
+   Включены только Docx/Excel/Txt/Csv/Html-ридеры и PDF-ридеры текстового слоя;
+   выбор ридера по расширению — внутри `ReaderComposition`.
+3. **CSV/TSV читаются dedoc нативно** (`CSVReader`), конвертация в txt не
+   понадобилась. Но: `delimiter` (автодетект/таб) и `encoding=utf-8`
+   передаются явно — детектор dedoc (charset_normalizer) на короткой кириллице
+   ошибается (`utf_16_be`, кракозябры).
+4. **PDF-таблицы без Java/tesseract — текстом** (см. «Форматы»).
+5. **`ParseResult.tree` внутри сервиса — полное дерево**, превью (30 символов)
+   строит слой API/UI последним шагом — иначе чанкинг работал бы по
+   обрезанному тексту.
+6. Тесты API ходят через `fastapi.testclient.TestClient` (как раньше);
+   `performance`-тест PDF ослаблен до 60 c (реальный парсинг dedoc тяжелее
+   markitdown).
+7. `xlwt` (без зависимостей) добавлен только для генерации `.xls`-фикстур.
+8. Хранилище результатов — в памяти (`DocumentStore`, LRU-64), ошибки
+   валидации запроса — 400, неподдерживаемые форматы — 422 (единый код по ТЗ).
+9. **Ребилд иерархии после промоции** (вне ТЗ, по итогам e2e на реальном
+   годовом отчёте): dedoc вкладывает контент в поддерево list-узлов
+   (автонумерация Word → префиксы `N)`), а стековая сборка без ребилда
+   никогда не выносит промоутнутый заголовок из чужой вложенности —
+   «Раздел 2» погребается под пунктом «3)». Поэтому дерево сплющивается
+   и пересобирается по уровням (lift), `N)`-пункты подавляются в
+   «Раздел N»-документах, TOC-серии (≥5) не промоутятся. Проверено на
+   годовом отчёте: 24 заголовка, 0 крошек с `N)`, 0 крошек с двумя
+   «Раздел N».
+10. **Привязка таблиц по `TableAnnotation`** (в dedoc 2.8 нет
+    `paragraph_node_id` — проверено grep по пакету): таблицы вставляются
+    первым ребёнком якоря после промоции; порядок 8/8 сверен с нативным
+    `json2md` (у него те же правила: inline по аннотации, остаток в конец).

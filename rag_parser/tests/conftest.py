@@ -49,6 +49,10 @@ def make_csv_files(tmp_path: Path) -> dict:
             tmp_path / "semicolon.csv", CSV_SEMICOLON.encode("utf-8")
         ),
         "csv_comma": write_bytes(tmp_path / "comma.csv", CSV_COMMA.encode("utf-8")),
+        "tsv": write_bytes(
+            tmp_path / "data.tsv",
+            "name\tqty\tprice\napple\t3\t1.5\nbanana\t10\t0.75\n".encode("utf-8"),
+        ),
     }
 
 
@@ -58,6 +62,7 @@ def make_html_files(tmp_path: Path) -> dict:
         "html_minimal": write_bytes(
             tmp_path / "minimal.html", HTML_MINIMAL.encode("utf-8")
         ),
+        "htm": write_bytes(tmp_path / "page.htm", HTML_DOC.encode("utf-8")),
     }
 
 
@@ -132,6 +137,23 @@ def make_xlsx_files(tmp_path: Path) -> dict:
     sheet.append(["merged-row", None, None])
     sheet.merge_cells("A4:C4")
     sheet.append(["d", "e", "f"])
+    sheet.append(["2D-block", "B6", "C6"])
+    sheet.merge_cells("B6:C7")
+    sheet.append(["A7", None, None])
+    vertical = merged.create_sheet("Vertical")
+    vertical.append(["top", "x"])
+    vertical.merge_cells("A1:A3")
+    vertical.append([None, "y"])
+    vertical.append([None, "z"])
+    # Анти-регрессия лево-право vs верх-вниз: мёрдж B2:B5 во 2-й колонке,
+    # в 1-й колонке каждой строки — РАЗЛИЧНЫЕ значения.
+    vcol = merged.create_sheet("VCol")
+    vcol.append(["id", "Группа"])
+    vcol.append(["r1", "TOP"])
+    vcol.merge_cells("B2:B5")
+    vcol.append(["r2", None])
+    vcol.append(["r3", None])
+    vcol.append(["r4", None])
     merged_path = tmp_path / "merged.xlsx"
     merged.save(merged_path)
     return {
@@ -139,6 +161,71 @@ def make_xlsx_files(tmp_path: Path) -> dict:
         "xlsx_single": second_path,
         "xlsx_merged": merged_path,
     }
+
+
+def make_xls_files(tmp_path: Path) -> dict:
+    """Копирует предсгенерированный .xls (xlwt — только локально для генерации)."""
+    import shutil
+
+    source = Path(__file__).resolve().parent.parent / "test_data" / "sample.xls"
+    target = tmp_path / "sample.xls"
+    shutil.copy(source, target)
+    return {"xls": target}
+
+
+def make_header_docs(tmp_path: Path) -> dict:
+    """Пара фикстур для HeaderPromoter: со стилями Word и без (визуальные)."""
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt
+
+    styled = Document()
+    styled.add_heading("Раздел 1. Общие сведения", level=1)
+    styled.add_paragraph("Первый абзац со сведениями о документе.")
+    styled.add_heading("1.1 Метрики качества", level=2)
+    styled.add_paragraph("Абзац про метрики качества чанкинга.")
+    styled_path = tmp_path / "styled.docx"
+    styled.save(styled_path)
+
+    unstyled = Document()
+    title = unstyled.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run("Раздел 2. Основные показатели")
+    run.bold = True
+    run.font.size = Pt(16)
+    unstyled.add_paragraph(
+        "Длинный абзац тела документа, в котором подробно описываются "
+        "основные показатели работы системы в отчётном периоде. " * 4
+    )
+    subtitle = unstyled.add_paragraph()
+    run2 = subtitle.add_run("2.1 Детализация по кварталам")
+    run2.bold = True
+    run2.font.size = Pt(14)
+    unstyled.add_paragraph("Короткий абзац детализации.")
+    unstyled_path = tmp_path / "unstyled.docx"
+    unstyled.save(unstyled_path)
+    return {"styled": styled_path, "unstyled": unstyled_path}
+
+
+def make_annual_report_doc(tmp_path: Path) -> Path:
+    """Фикстура в стиле 2023.docx: TOC + тело с N)-пунктом и подуровнями."""
+    from docx import Document
+
+    doc = Document()
+    doc.add_paragraph("Годовой отчет акционерного общества за 2023 год.")
+    for index in range(1, 7):
+        doc.add_paragraph(f"Раздел {index}. Строка оглавления годового отчета")
+    doc.add_paragraph("Раздел 1. Информация о годовом отчете общества")
+    doc.add_paragraph("Тело первого раздела с общими сведениями.")
+    doc.add_paragraph("1) достоверность годового отчета подтверждена ревизией")
+    doc.add_paragraph("2) годовой отчет предварительно утвержден советом директоров")
+    doc.add_paragraph("3) годовой отчет утвержден общим собранием акционеров")
+    doc.add_paragraph("Раздел 2. Сведения об обществе и его деятельности")
+    doc.add_paragraph("2.1. Полное наименование общества.")
+    doc.add_paragraph("Тело подраздела с реквизитами общества.")
+    path = tmp_path / "annual_2023_style.docx"
+    doc.save(path)
+    return path
 
 
 def _pdf_escape(text: str) -> str:
@@ -277,6 +364,21 @@ def docx_files(tmp_path):
 @pytest.fixture
 def xlsx_files(tmp_path):
     return make_xlsx_files(tmp_path)
+
+
+@pytest.fixture
+def xls_files(tmp_path):
+    return make_xls_files(tmp_path)
+
+
+@pytest.fixture
+def header_docs(tmp_path):
+    return make_header_docs(tmp_path)
+
+
+@pytest.fixture
+def annual_report_doc(tmp_path):
+    return make_annual_report_doc(tmp_path)
 
 
 @pytest.fixture

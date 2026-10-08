@@ -75,7 +75,8 @@ class RecursiveChunker(BaseChunker):
         self.source = source
         self.min_characters_per_chunk = min_characters_per_chunk
         self.chunker = _ChonkieRecursiveChunker(
-            tokenizer=TOKENIZER_NAME,
+            # Позиционно: 1.3.x — ``tokenizer_or_token_counter``, 1.7.x — ``tokenizer``.
+            TOKENIZER_NAME,
             chunk_size=self.chunk_size,
             rules=build_rules(self.separators),
             min_characters_per_chunk=self.min_characters_per_chunk,
