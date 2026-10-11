@@ -27,23 +27,6 @@ CHUNKING_TYPES = ["none", "fixed", "sentence", "semantic", "recursive"]
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    monkeypatch.setattr(
-        settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
-    )
-    document_store = DocumentStore(max_items=4)
-    import rag_parser.api.routes as routes
-
-    previous = routes.document_store
-    routes.document_store = document_store
-    with TestClient(app, raise_server_exceptions=False) as test_client:
-        yield test_client
-    routes.document_store = previous
-
-
-@pytest.fixture
 def all_documents(pdf_files, docx_files, xlsx_files, xls_files, csv_files,
                   html_files, text_files):
     return {
@@ -91,7 +74,9 @@ class TestMetaEndpoints:
         body = response.json()
         for extension in SUPPORTED_EXTENSIONS:
             assert extension in body["supported_extensions"]
-        assert ".doc" not in body["supported_extensions"]
+        assert ".pptx" not in body["supported_extensions"]
+        assert ".epub" not in body["supported_extensions"]
+        assert len(body["supported_extensions"]) == 14
         assert body["max_file_size_mb"] == settings.MAX_FILE_SIZE_MB
         assert body["chunking_types"] == CHUNKING_TYPES
 
@@ -308,8 +293,8 @@ class TestParseErrors:
         assert response.status_code == 422
         assert "Unsupported" in response.json()["detail"]
 
-    def test_doc_rejected_with_422(self, client, tmp_path):
-        path = tmp_path / "old.doc"
+    def test_pptx_rejected_with_422(self, client, tmp_path):
+        path = tmp_path / "slides.pptx"
         path.write_bytes(b"fake word content")
         files, data = upload(path)
         response = client.post("/api/parse", files=files, data=data)
@@ -360,8 +345,6 @@ class TestParseErrors:
             {"chunking_type": "unknown"},
             {"threshold": "0"},
             {"threshold": "1.5"},
-            {"table_chunk_size": "0"},
-            {"table_chunk_size": "100"},
             {"header_threshold": "-1"},
             {"header_threshold": "9"},
         ],
@@ -516,7 +499,7 @@ class TestDependenciesUnit:
         with pytest.raises(UnsupportedFormatError):
             get_parser("file.exe")
         with pytest.raises(UnsupportedFormatError):
-            get_parser("file.doc")
+            get_parser("file.pptx")
 
     def test_get_parser_header_threshold(self):
         assert get_parser("a.docx", header_threshold=2.0).header_threshold == 2.0
@@ -549,7 +532,11 @@ class TestDependenciesUnit:
         assert sorted(extensions) == sorted(SUPPORTED_EXTENSIONS)
         assert ".xlsm" not in extensions
         assert ".pptx" not in extensions
-        assert ".md" not in extensions
+        assert ".md" in extensions          # добавлен в Этапе 1
+        assert ".doc" in extensions
+        assert ".odt" in extensions
+        assert ".rtf" in extensions
+        assert ".xml" in extensions
 
     def test_validate_upload_size(self, monkeypatch):
         monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 0)
@@ -662,3 +649,71 @@ class TestFrontend:
 
         with pytest.raises(DocumentParseError):
             process(Upload(), ChunkingType.NONE, 500, 50)
+
+
+class TestParentMetadataInApi:
+    """parent_id и chunk_order должны доезжать до ответа POST /api/parse."""
+
+    def test_response_contains_parent_fields(self, client, docx_files):
+        files, data = upload(docx_files["docx_headings"],
+                             chunking_type="fixed")
+        response = client.post("/api/parse", files=files, data=data)
+        assert response.status_code == 200
+        chunks = response.json()["chunks"] or []
+        assert chunks
+        for chunk in chunks:
+            assert "parent_id" in chunk
+            assert "chunk_order" in chunk
+            assert isinstance(chunk["chunk_order"], int)
+
+    def test_chunked_response_groups_by_parent(self, client, docx_files):
+        files, data = upload(docx_files["docx_headings"],
+                             chunking_type="fixed")
+        response = client.post("/api/parse", files=files, data=data)
+        chunks = response.json()["chunks"] or []
+        assert chunks
+        groups = {}
+        for chunk in chunks:
+            if chunk["parent_id"]:
+                groups.setdefault(chunk["parent_id"], []).append(
+                    chunk["chunk_order"]
+                )
+        assert groups, "в документе с заголовками должны быть parent_id"
+        for parent_id, orders in groups.items():
+            assert orders == list(range(len(orders))), parent_id
+
+
+class TestPdfWithoutTextLayer:
+    """PDF без текстового слоя → 422 (OCR отключён), а не 400."""
+
+    def test_pdf_no_text_layer_returns_422(self, client, pdf_files):
+        path = pdf_files["pdf_scan"]
+        files, data = upload(path)
+        response = client.post("/api/parse", files=files, data=data)
+
+        assert response.status_code == 422, response.text
+        assert "OCR отключён" in response.json()["detail"]
+        assert response.headers.get("X-Error-Type") == "ocr_disabled"
+
+    def test_message_matches_spec(self, client, pdf_files):
+        from rag_parser.core.interfaces import OcrDisabledError
+
+        assert OcrDisabledError.MESSAGE == (
+            "PDF без текстового слоя не поддерживается, OCR отключён"
+        )
+        files, data = upload(pdf_files["pdf_scan"])
+        response = client.post("/api/parse", files=files, data=data)
+        assert response.json()["detail"] == OcrDisabledError.MESSAGE
+
+    def test_text_layer_pdf_still_parses(self, client, pdf_files):
+        """Контроль: PDF с текстовым слоем разбирается как обычно (200)."""
+        files, data = upload(pdf_files["pdf_text"])
+        response = client.post("/api/parse", files=files, data=data)
+        assert response.status_code == 200
+        assert response.json()["markdown"].strip()
+
+    def test_scan_is_not_reported_as_parse_error(self, client, pdf_files):
+        """Отказ по OCR не должен маскироваться под общий сбой разбора."""
+        files, data = upload(pdf_files["pdf_scan"])
+        response = client.post("/api/parse", files=files, data=data)
+        assert response.headers.get("X-Error-Type") != "parse_error"

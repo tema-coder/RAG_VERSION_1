@@ -324,6 +324,14 @@ def make_pdf_files(tmp_path: Path) -> dict:
             [[["Region", "Q1", "Q2"], ["North", "100", "120"], ["South", "90", "95"]]],
             tmp_path / "table.pdf",
         ),
+        # Валидный PDF БЕЗ текстового слоя — эмуляция скана: страница есть,
+        # текстовых операторов нет. Настоящий OCR отключён, поэтому такой
+        # документ обязан давать 422, а не 400.
+        "pdf_scan": _build_pdf(
+            [[]],  # ни одного BT/Tj — только пустая страница
+            None,
+            tmp_path / "scan.pdf",
+        ),
     }
 
 
@@ -394,3 +402,28 @@ def invalid_files(tmp_path):
 @pytest.fixture
 def sample_text():
     return SENTENCE_TEXT
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    """TestClient приложения с изолированным document_store.
+
+    Общий фикстур: используется и в test_api.py, и в test_retrieval.py
+    (интеграционные тесты Child-Parent эндпоинта).
+    """
+    from fastapi.testclient import TestClient
+
+    from rag_parser.api.dependencies import DocumentStore
+    from rag_parser.core.config import settings
+
+    monkeypatch.setattr(
+        settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
+    )
+    import rag_parser.api.routes as routes
+    from rag_parser.main import app
+
+    previous = routes.document_store
+    routes.document_store = DocumentStore(max_items=16)
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        yield test_client
+    routes.document_store = previous

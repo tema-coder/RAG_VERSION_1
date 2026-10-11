@@ -105,35 +105,32 @@ def _count_data_rows(table_markdown: str) -> int:
 
 
 class TableChunkerRAG(BaseChunker):
-    """Table chunker: every chunk keeps the table header.
+    """Table chunker: **ровно одна строка данных на чанк** (ТЗ 3.3).
 
-    Uses chonkie ``TableChunker(tokenizer="row")`` so the header row is
-    automatically attached to each chunk. If the installed chonkie version
-    does not support ``tokenizer="row"``, falls back to manual grouping of
-    data rows with the header prepended.
+    Каждый чанк содержит заголовок таблицы, разделитель и ОДНУ строку
+    данных. Количество строк не настраивается: это жёсткое требование
+    бизнес-логики (поиск по конкретной строке таблицы), а не параметр
+    качества, поэтому параметра ``chunk_size`` здесь нет вовсе.
+
+    Используется chonkie ``TableChunker(tokenizer="row", chunk_size=1)``:
+    заголовок сам прикрепляется к каждому чанку. Если установленная версия
+    chonkie не поддерживает ``tokenizer="row"``, используется ручной
+    fallback с тем же инвариантом (по одной строке на чанк).
     """
 
     name = CHUNKER_NAME
 
-    def __init__(
-        self,
-        chunk_size: Optional[int] = None,
-        source: str = "document",
-    ) -> None:
-        from rag_parser.core.config import settings
+    #: Единственное допустимое число строк данных в чанке таблицы.
+    ROWS_PER_CHUNK: int = 1
 
-        self.chunk_size = int(
-            settings.DEFAULT_TABLE_CHUNK_SIZE if chunk_size is None else chunk_size
-        )
-        if self.chunk_size < 1:
-            raise ValueError("chunk_size must be >= 1")
+    def __init__(self, source: str = "document") -> None:
         self.source = source
         self._fallback = False
         try:
             from chonkie import TableChunker as _ChonkieTableChunker
 
             self.chunker = _ChonkieTableChunker(
-                tokenizer="row", chunk_size=self.chunk_size
+                tokenizer="row", chunk_size=self.ROWS_PER_CHUNK
             )
         except Exception:  # noqa: BLE001 - old chonkie without row tokenizers
             logger.warning("table_chunker_fallback", reason="row tokenizer unsupported")
@@ -141,6 +138,10 @@ class TableChunkerRAG(BaseChunker):
             self._fallback = True
 
     def _fallback_chunks(self, table_markdown: str) -> List[str]:
+        """Ручная нарезка: шапка + ровно одна строка данных.
+
+        Используется только если chonkie не даёт ``tokenizer="row"``.
+        """
         lines = [
             line for line in table_markdown.strip().splitlines() if line.strip()
         ]
@@ -149,13 +150,11 @@ class TableChunkerRAG(BaseChunker):
             return []
         header, data = rows[0], rows[1:]
         separator = "|" + "|".join(["---"] * len(_split_row(header))) + "|"
-        parts: List[str] = []
-        for start in range(0, max(len(data), 1), self.chunk_size):
-            group = data[start : start + self.chunk_size]
-            if not group and data:
-                continue
-            parts.append("\n".join([header, separator, *group]))
-        return parts or (["\n".join([header, separator])] if not data else [])
+        if not data:
+            return []
+        return [
+            "\n".join([header, separator, row]) for row in data
+        ]
 
     def chunk(self, text: str, metadata: Optional[dict] = None) -> List[Chunk]:
         metadata = metadata or {}
@@ -184,7 +183,7 @@ class TableChunkerRAG(BaseChunker):
                         "chunker": self.name,
                         "source_type": "markdown_table",
                         "data_rows": _count_data_rows(table_text),
-                        "chunk_size": self.chunk_size,
+                        "rows_per_chunk": self.ROWS_PER_CHUNK,
                         **extra,
                     },
                     text_for_embedding=natural or None,

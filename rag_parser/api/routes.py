@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import quote
 
 import orjson
@@ -28,6 +28,7 @@ from rag_parser.core.interfaces import (
     DocumentError,
     DocumentParseError,
     FileTooLargeError,
+    OcrDisabledError,
     ParseResult,
     UnsupportedFormatError,
 )
@@ -47,18 +48,16 @@ def _error(status_code: int, message: str, error: str) -> HTTPException:
 def _chunking_params(
     chunk_size: Optional[int],
     overlap: Optional[int],
-    table_chunk_size: Optional[int],
     threshold: Optional[float],
     header_threshold: Optional[float],
 ) -> dict:
-    """Resolves and validates the chunking/header parameters of /api/parse."""
+    """Resolves and validates the chunking/header parameters of /api/parse.
+
+    ``table_chunk_size`` здесь нет намеренно: по ТЗ 3.3 табличный чанк
+    всегда содержит ровно одну строку данных, параметра у него нет.
+    """
     chunk_size = settings.DEFAULT_CHUNK_SIZE if chunk_size is None else chunk_size
     overlap = settings.DEFAULT_OVERLAP if overlap is None else overlap
-    table_chunk_size = (
-        settings.DEFAULT_TABLE_CHUNK_SIZE
-        if table_chunk_size is None
-        else table_chunk_size
-    )
     threshold = settings.SEMANTIC_THRESHOLD if threshold is None else threshold
     if header_threshold is None:
         header_threshold = settings.HEADER_PROMOTION_THRESHOLD
@@ -71,10 +70,6 @@ def _chunking_params(
         )
     if overlap < 0 or overlap > 500:
         raise _error(400, "overlap must be between 0 and 500", "invalid_params")
-    if table_chunk_size < 1 or table_chunk_size > 50:
-        raise _error(
-            400, "table_chunk_size must be between 1 and 50", "invalid_params"
-        )
     if not 0.0 < threshold < 1.0:
         raise _error(
             400, "threshold must be strictly between 0 and 1", "invalid_params"
@@ -86,7 +81,6 @@ def _chunking_params(
     return {
         "chunk_size": chunk_size,
         "overlap": overlap,
-        "table_chunk_size": table_chunk_size,
         "threshold": threshold,
         "header_threshold": header_threshold,
     }
@@ -104,6 +98,8 @@ def _result_to_response(result: ParseResult) -> ParseResponse:
                 metadata=chunk.metadata,
                 text_for_embedding=chunk.text_for_embedding,
                 breadcrumb=chunk.breadcrumb,
+                parent_id=chunk.parent_id,
+                chunk_order=chunk.chunk_order,
             )
             for chunk in result.chunks
         ]
@@ -154,19 +150,15 @@ async def parse_document(
     chunking_type: ChunkingType = Form(ChunkingType.NONE),
     chunk_size: Optional[int] = Form(None),
     overlap: Optional[int] = Form(None),
-    table_chunk_size: Optional[int] = Form(None),
     threshold: Optional[float] = Form(None),
     header_threshold: Optional[float] = Form(None),
 ) -> ParseResponse:
     started = time.perf_counter()
     filename = file.filename or ""
 
-    chunking = _chunking_params(
-        chunk_size, overlap, table_chunk_size, threshold, header_threshold
-    )
+    chunking = _chunking_params(chunk_size, overlap, threshold, header_threshold)
     chunk_size = chunking["chunk_size"]
     overlap = chunking["overlap"]
-    table_chunk_size = chunking["table_chunk_size"]
     threshold = chunking["threshold"]
     header_threshold = chunking["header_threshold"]
 
@@ -198,7 +190,6 @@ async def parse_document(
             overlap,
             source=filename,
             threshold=threshold,
-            table_chunk_size=table_chunk_size,
         )
         if chunker is not None:
             from rag_parser.chunkers.hybrid import HybridRagChunker
@@ -215,6 +206,10 @@ async def parse_document(
                 )
     except UnsupportedFormatError as exc:
         raise _error(422, exc.message, "unsupported_format") from exc
+    except OcrDisabledError as exc:
+        # ВАЖНО: ловим ДО DocumentParseError — подтип наследует его, иначе
+        # осознанный отказ «OCR отключён» уехал бы в общий 400.
+        raise _error(422, exc.message, "ocr_disabled") from exc
     except DocumentParseError as exc:
         raise _error(400, exc.message, "parse_error") from exc
     except ValueError as exc:
@@ -253,6 +248,52 @@ async def parse_document(
         time.perf_counter() - started,
     )
     return response
+
+
+@router.get(
+    "/parse/{document_id}/parents",
+    response_model=List[ChunkResponse],
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+async def get_parent_group(
+    document_id: str,
+    index: int = Query(..., ge=0, description="Индекс найденного чанка"),
+) -> List[ChunkResponse]:
+    """Child-Parent выдача: разворачивает найденный чанк в его раздел.
+
+    ТЗ 3.4: если у чанка есть ``parent_id``, возвращаются ВСЕ чанки этого
+    родителя по возрастанию ``chunk_order``; если ``parent_id is None`` —
+    только сам найденный чанк.
+    """
+    from rag_parser.core.retrieval import chunks_from_dicts, expand_to_parents
+
+    document = document_store.get(document_id)
+    if document is None:
+        raise _error(404, f"Document {document_id} not found", "not_found")
+
+    chunks = chunks_from_dicts(document.get("chunks") or [])
+    if index >= len(chunks):
+        raise _error(
+            400,
+            f"index {index} out of range: document has {len(chunks)} chunks",
+            "index_out_of_range",
+        )
+
+    group = expand_to_parents(chunks, index)
+    return [
+        ChunkResponse(
+            index=chunk.index,
+            text=chunk.text,
+            tokens=chunk.tokens,
+            source=chunk.source,
+            metadata=chunk.metadata,
+            text_for_embedding=chunk.text_for_embedding,
+            breadcrumb=chunk.breadcrumb,
+            parent_id=chunk.parent_id,
+            chunk_order=chunk.chunk_order,
+        )
+        for chunk in group
+    ]
 
 
 @router.get(

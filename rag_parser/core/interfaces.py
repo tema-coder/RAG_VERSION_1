@@ -27,6 +27,22 @@ class DocumentParseError(DocumentError):
         super().__init__(message, filename=filename)
 
 
+class OcrDisabledError(DocumentParseError):
+    """PDF без текстового слоя: OCR отключён (ТЗ — HTTP 422).
+
+    Сервис работает только с текстовым слоем PDF (ограничение «только CPU,
+    без OCR»). Скан или картинка без текстового слоя разобрать нечем, поэтому
+    это НЕ ошибка парсера, а осознанный отказ: отдельный подтип нужен, чтобы
+    отличать её от настоящих сбоев разбора и отвечать 422, а не 400.
+    """
+
+    #: Текст ошибки зафиксирован ТЗ — используется в тестах и в README.
+    MESSAGE = "PDF без текстового слоя не поддерживается, OCR отключён"
+
+    def __init__(self, *, filename: Optional[str] = None) -> None:
+        super().__init__(self.MESSAGE, filename=filename)
+
+
 class FileTooLargeError(DocumentError):
     def __init__(self, size_bytes: int, max_bytes: int) -> None:
         super().__init__(
@@ -63,6 +79,18 @@ class DocumentNode:
 
 @dataclass
 class Chunk:
+    """Чанк документа.
+
+    ``parent_id`` — идентификатор ближайшего заголовка, к которому относится
+    чанк (ТЗ 3.4). Идентификаторы детерминированные (``h_1``, ``h_2``, ...):
+    они назначаются по порядку обхода дерева, поэтому при повторном разборе
+    того же документа не меняются. В документе без заголовков остаётся ``None``.
+
+    ``chunk_order`` — порядковый номер чанка ВНУТРИ родителя, начиная с 0.
+    Вместе с ``parent_id`` он позволяет развернуть найденный чанк обратно в
+    полный родительский раздел (см. ``core.retrieval.expand_to_parents``).
+    """
+
     index: int
     text: str
     tokens: int
@@ -70,6 +98,8 @@ class Chunk:
     metadata: Dict[str, Any] = field(default_factory=dict)
     text_for_embedding: Optional[str] = None
     breadcrumb: Optional[str] = None
+    parent_id: Optional[str] = None
+    chunk_order: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

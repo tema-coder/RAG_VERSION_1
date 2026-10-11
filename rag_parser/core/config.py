@@ -9,15 +9,24 @@ PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DEDOC_OUTPUT_DIR = str(PACKAGE_ROOT / "output" / "dedoc_results")
 
 DEFAULT_SUPPORTED_EXTENSIONS = [
+    # Офисные (dedoc конвертирует .doc/.odt/.rtf через LibreOffice)
     ".docx",
+    ".doc",
+    ".odt",
+    ".rtf",
+    # Табличные
     ".xlsx",
     ".xls",
+    ".csv",
+    ".tsv",
+    # PDF (только текстовый слой, OCR отключён)
     ".pdf",
+    # Текстовые и разметка
     ".html",
     ".htm",
     ".txt",
-    ".csv",
-    ".tsv",
+    ".xml",
+    ".md",
 ]
 
 
@@ -25,7 +34,6 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = 50
     DEFAULT_CHUNK_SIZE: int = 200
     DEFAULT_OVERLAP: int = 50
-    DEFAULT_TABLE_CHUNK_SIZE: int = 5
     SEMANTIC_MODEL_NAME: str = "deepvk/USER-bge-m3"
     SEMANTIC_THRESHOLD: float = 0.5
     TEMP_DIR: str = "./temp"
@@ -34,7 +42,10 @@ class Settings(BaseSettings):
     DOC_STORE_MAX_ITEMS: int = 64
     SUPPORTED_EXTENSIONS: List[str] = DEFAULT_SUPPORTED_EXTENSIONS
     HEADER_PROMOTION_THRESHOLD: float = 4.0
-    BREADCRUMB_MAX_DEPTH: int = 3
+    # ТЗ 3.2: в крошку входят максимум ДВА последних уровня заголовков.
+    # Например 1.1 -> 1.1.1 -> 1.1.1.1 даёт "1.1.1 Название > 1.1.1.1 Название".
+    # 0 или меньше отключает ограничение (весь путь) — для отладки.
+    BREADCRUMB_MAX_DEPTH: int = 2
     TREE_TEXT_PREVIEW_LEN: int = 30
 
     model_config = SettingsConfigDict(

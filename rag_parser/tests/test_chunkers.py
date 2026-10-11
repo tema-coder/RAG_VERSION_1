@@ -304,27 +304,57 @@ class TestTableToNaturalLanguage:
 
 
 class TestTableChunkerRAG:
-    def test_seven_rows_two_chunks_with_header(self):
-        chunks = TableChunkerRAG(chunk_size=5).chunk(_table_7(), {})
-        assert len(chunks) == 2
+    def test_seven_rows_seven_chunks_one_row_each(self):
+        """ТЗ 3.3: N строк данных -> ровно N чанков, по одной строке."""
+        chunks = TableChunkerRAG().chunk(_table_7(), {})
+        assert len(chunks) == 7
         for chunk in chunks:
             lines = chunk.text.splitlines()
             assert lines[0] == "| A | B |"
             assert "|" in chunk.text
-        assert _count_data(chunk_text(chunks[0])) == 5
-        assert _count_data(chunk_text(chunks[1])) == 2
+            assert _count_data(chunk_text(chunk)) == 1
+
+    def test_one_chunk_per_data_row(self):
+        """Инвариант: ни один чанк не содержит более 1 строки данных."""
+        for rows in (1, 2, 3, 5, 12):
+            table = (
+                "| A | B |\n|---|---|\n"
+                + "".join(f"| {i} | {i * 2} |\n" for i in range(rows))
+            )
+            chunks = TableChunkerRAG().chunk(table, {})
+            assert len(chunks) == rows, f"{rows} строк -> {len(chunks)} чанков"
+            assert all(_count_data(chunk_text(c)) == 1 for c in chunks)
+
+    def test_no_chunk_size_parameter(self):
+        """Параметра размера чанка быть не должно вовсе."""
+        import inspect
+
+        params = inspect.signature(TableChunkerRAG.__init__).parameters
+        assert "chunk_size" not in params
+        assert TableChunkerRAG.ROWS_PER_CHUNK == 1
 
     def test_text_for_embedding_format(self):
-        chunks = TableChunkerRAG(chunk_size=5).chunk(_table_7(), {})
+        chunks = TableChunkerRAG().chunk(_table_7(), {})
         for chunk in chunks:
             assert chunk.text_for_embedding
             assert "|" not in chunk.text_for_embedding
             assert "A:" in chunk.text_for_embedding
             assert chunk.metadata["source_type"] == "markdown_table"
 
+    def test_dual_representation_invariant(self):
+        """text — Markdown с '|', text_for_embedding — NL без '|'."""
+        chunks = TableChunkerRAG().chunk(_table_7(), {})
+        assert chunks
+        for chunk in chunks:
+            assert "|" in chunk.text, "text должен оставаться Markdown"
+            assert "|" not in chunk.text_for_embedding
+            assert "\n" not in chunk.text_for_embedding, (
+                "NL-представление — одна строка 'Колонка: значение'"
+            )
+
     def test_placeholder_table_is_cleaned(self):
         dirty = "|  |  |\n|---|---|\n| H1 | H2 |\n| a | b |"
-        chunks = TableChunkerRAG(chunk_size=5).chunk(dirty, {})
+        chunks = TableChunkerRAG().chunk(dirty, {})
         assert len(chunks) == 1
         assert chunks[0].text.splitlines()[0] == "| H1 | H2 |"
 
@@ -332,9 +362,19 @@ class TestTableChunkerRAG:
         assert TableChunkerRAG().chunk("Just text", {}) == []
         assert TableChunkerRAG().chunk("", {}) == []
 
-    def test_invalid_chunk_size(self):
-        with pytest.raises(ValueError):
-            TableChunkerRAG(chunk_size=0)
+    def test_header_without_data_rows_returns_empty(self):
+        assert TableChunkerRAG().chunk("| A | B |\n|---|---|", {}) == []
+
+    def test_fallback_also_one_row_per_chunk(self):
+        """Fallback-ветка держит тот же инвариант, что и chonkie."""
+        chunker = TableChunkerRAG()
+        chunker.chunker = None
+        chunker._fallback = True
+        chunks = chunker.chunk(_table_7(), {})
+        assert len(chunks) == 7
+        for chunk in chunks:
+            assert chunk.text.splitlines()[0] == "| A | B |"
+            assert _count_data(chunk_text(chunk)) == 1
 
 
 def chunk_text(chunk: Chunk) -> str:
@@ -361,7 +401,7 @@ class TestHybridRagChunker:
     @pytest.mark.parametrize("strategy", ["token", "sentence", "recursive"])
     def test_mixed_document(self, strategy):
         hybrid = HybridRagChunker(
-            text_strategy=strategy, chunk_size=100, overlap=10, table_chunk_size=5
+            text_strategy=strategy, chunk_size=100, overlap=10
         )
         chunks = hybrid.chunk(self._doc(), {"source": "doc.md"})
         assert_chunk_invariants(chunks, source="doc.md")
@@ -371,11 +411,13 @@ class TestHybridRagChunker:
 
         tables = [c for c in chunks if c.metadata["chunk_type"] == "table"]
         texts = [c for c in chunks if c.metadata["chunk_type"] == "text"]
-        assert len(tables) == 2
+        # Таблица из _table_7() — 7 строк данных -> 7 чанков по одной строке.
+        assert len(tables) == 7
         for chunk in tables:
             assert chunk.text_for_embedding
             assert "|" not in chunk.text_for_embedding
             assert chunk.metadata["source_type"] == "markdown_table"
+            assert _count_data(chunk_text(chunk)) == 1
         for chunk in texts:
             assert chunk.text_for_embedding is None
 
@@ -446,3 +488,171 @@ class TestHybridBreadcrumbEnrichment:
         hybrid = HybridRagChunker(text_strategy="token", chunk_size=100, overlap=10)
         chunks = hybrid.chunk("ignored", {}, tree=tree)
         assert all(c.breadcrumb is None for c in chunks)
+
+
+def _parent_tree():
+    """Дерево: вступление без заголовка + два раздела (текст + таблица)."""
+    from rag_parser.core.interfaces import DocumentNode
+
+    def node(node_type, text, children=None, level=1):
+        return DocumentNode(
+            type=node_type, level=level, text=text,
+            children=children or [], metadata={},
+        )
+
+    return DocumentNode(
+        type="document", level=0, text="", children=[
+            node("paragraph", "Вступление до первого заголовка.", level=0),
+            node("header", "Раздел 1", [
+                node("paragraph", "Первый абзац раздела один."),
+                node("paragraph", "Второй абзац раздела один."),
+            ]),
+            node("header", "Раздел 2", [
+                node("paragraph", "Абзац второго раздела."),
+                node("table", "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 |",
+                     level=0),
+            ]),
+        ], metadata={},
+    )
+
+
+class TestParentAndOrder:
+    """ТЗ 3.4: parent_id ближайшего заголовка и chunk_order внутри него."""
+
+    def _chunker(self):
+        return HybridRagChunker(text_strategy="token", chunk_size=100, overlap=10)
+
+    def test_parent_id_assignment(self):
+        """Чанки одного раздела делят parent_id, разные — нет."""
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        by_text = {c.text: c.parent_id for c in chunks}
+        assert by_text["Вступление до первого заголовка."] is None
+        assert by_text["Первый абзац раздела один."] is not None
+        assert by_text["Второй абзац раздела один."] == \
+            by_text["Первый абзац раздела один."]
+
+        parents = {c.parent_id for c in chunks if c.parent_id}
+        assert len(parents) == 2, "два раздела -> два parent_id"
+        # Заголовок сам является первым чанком своего раздела.
+        assert by_text["Раздел 1"] == by_text["Первый абзац раздела один."]
+        assert by_text["Раздел 2"] != by_text["Раздел 1"]
+
+    def test_chunk_order_sequence(self):
+        """Внутри одного родителя chunk_order идёт 0,1,2... без разрывов."""
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        groups = {}
+        for chunk in chunks:
+            if chunk.parent_id:
+                groups.setdefault(chunk.parent_id, []).append(chunk.chunk_order)
+        assert groups
+        for parent_id, orders in groups.items():
+            assert orders == list(range(len(orders))), (
+                f"{parent_id}: нарушена нумерация {orders}"
+            )
+
+    def test_order_restarts_for_each_parent(self):
+        """У КАЖДОГО родителя нумерация начинается с 0."""
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        groups = {}
+        for chunk in chunks:
+            if chunk.parent_id:
+                groups.setdefault(chunk.parent_id, []).append(chunk.chunk_order)
+        assert all(orders[0] == 0 for orders in groups.values())
+
+    def test_no_parent_for_orphan_chunks(self):
+        """Вступление до первого заголовка остаётся без родителя."""
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        orphans = [c for c in chunks if c.parent_id is None]
+        assert len(orphans) == 1
+        assert orphans[0].text == "Вступление до первого заголовка."
+        assert orphans[0].chunk_order == 0
+
+    def test_document_without_headers_all_orphans(self):
+        """Документ без заголовков: все чанки с parent_id=None."""
+        from rag_parser.core.interfaces import DocumentNode
+
+        tree = DocumentNode(
+            type="document", level=0, text="", children=[
+                DocumentNode(type="paragraph", level=0,
+                             text="Текст без заголовков.", children=[], metadata={}),
+            ], metadata={},
+        )
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=tree)
+        assert chunks
+        assert all(c.parent_id is None for c in chunks)
+
+    def test_table_chunks_have_parent_id(self):
+        """Табличные чанки наследуют parent_id ближайшего заголовка."""
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        tables = [c for c in chunks if c.metadata["chunk_type"] == "table"]
+        assert len(tables) == 3, "3 строки данных -> 3 табличных чанка"
+        assert len({c.parent_id for c in tables}) == 1
+        assert tables[0].parent_id is not None
+
+    def test_table_and_text_share_parent_and_are_contiguous(self):
+        """Текст и таблица раздела 2 — один родитель, порядок без дыр."""
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        section2 = [
+            c for c in chunks
+            if c.parent_id and c.text == "Раздел 2"
+        ][0].parent_id
+        group = [c for c in chunks if c.parent_id == section2]
+        kinds = [c.metadata["chunk_type"] for c in group]
+        # 0 — сам заголовок, 1 — абзац, далее три строки таблицы.
+        assert kinds == ["text", "text", "table", "table", "table"]
+        assert [c.chunk_order for c in group] == [0, 1, 2, 3, 4]
+        assert group[0].text == "Раздел 2"
+
+    def test_parent_id_deterministic_between_runs(self):
+        """Повторный разбор того же дерева даёт те же id и ту же нумерацию."""
+        first = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        second = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        assert [(c.parent_id, c.chunk_order) for c in first] == \
+               [(c.parent_id, c.chunk_order) for c in second]
+
+    def test_ids_are_deterministic_not_random(self):
+        """Формат id — h_<номер>: никаких uuid и хешей текста."""
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        parents = [c.parent_id for c in chunks if c.parent_id]
+        assert all(p.startswith("h_") for p in parents)
+        assert all(p[2:].isdigit() for p in parents)
+
+    def test_metadata_mirrors_fields(self):
+        """parent_id/chunk_order дублируются в metadata."""
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        for chunk in chunks:
+            if chunk.parent_id is None:
+                continue
+            assert chunk.metadata["parent_id"] == chunk.parent_id
+            assert chunk.metadata["chunk_order"] == chunk.chunk_order
+
+    def test_markdown_fallback_parent_id(self):
+        """Fallback-путь по # заголовкам тоже проставляет parent_id."""
+        markdown = (
+            "# Раздел 1\n\nПервый абзац.\n\n"
+            "## Подраздел\n\nВторой абзац.\n\n"
+            "# Раздел 2\n\nТретий абзац.\n"
+        )
+        chunks = self._chunker().chunk(markdown, {"source": "d"})
+        parents = {c.parent_id for c in chunks if c.parent_id}
+        assert len(parents) == 3  # Раздел 1, Подраздел, Раздел 2
+        groups = {}
+        for chunk in chunks:
+            if chunk.parent_id:
+                groups.setdefault(chunk.parent_id, []).append(chunk.chunk_order)
+        for parent_id, orders in groups.items():
+            assert orders == list(range(len(orders))), parent_id
+
+    def test_to_dict_contains_new_fields(self):
+        chunks = self._chunker().chunk("ignored", {"source": "d"}, tree=_parent_tree())
+        payload = chunks[0].to_dict()
+        assert "parent_id" in payload
+        assert "chunk_order" in payload
+
+    def test_default_values(self):
+        """Свежий Chunk без parent_id — None и chunk_order 0."""
+        from rag_parser.core.interfaces import Chunk
+
+        chunk = Chunk(index=0, text="x", tokens=1, source="s")
+        assert chunk.parent_id is None
+        assert chunk.chunk_order == 0

@@ -1,4 +1,4 @@
-"""Тесты единственного парсера — DedocParser (9 форматов)."""
+"""Тесты единственного парсера — DedocParser (14 форматов)."""
 
 import json
 import re
@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from rag_parser.core.config import settings
-from rag_parser.core.interfaces import DocumentParseError, UnsupportedFormatError
+from rag_parser.core.interfaces import (
+    DocumentParseError,
+    OcrDisabledError,
+    UnsupportedFormatError,
+)
 from rag_parser.parsers.dedoc_parser import (
     MARKDOWN_FILE_PREFIX,
     SUPPORTED_EXTENSIONS,
@@ -40,13 +44,24 @@ def parser(tmp_path, monkeypatch):
 
 
 class TestSupported:
-    def test_nine_formats(self):
+    def test_fourteen_formats(self):
         assert DedocParser().supported_extensions() == SUPPORTED_EXTENSIONS
         assert sorted(SUPPORTED_EXTENSIONS) == sorted(
-            [".docx", ".xlsx", ".xls", ".pdf", ".html", ".htm",
-             ".txt", ".csv", ".tsv"]
+            [".docx", ".doc", ".odt", ".rtf",
+             ".xlsx", ".xls", ".csv", ".tsv",
+             ".pdf",
+             ".html", ".htm", ".txt", ".xml", ".md"]
         )
         assert DedocParser.format == "dedoc"
+
+    def test_format_count_matches_tz(self):
+        # 13 расширений из ТЗ + .tsv (решение владельца: .tsv остаётся).
+        assert len(SUPPORTED_EXTENSIONS) == 14
+
+    def test_libreoffice_formats_declared(self):
+        from rag_parser.parsers.dedoc_parser import LIBREOFFICE_EXTENSIONS
+
+        assert set(LIBREOFFICE_EXTENSIONS) == {".doc", ".odt", ".rtf"}
 
     def test_parameters_pdf(self, tmp_path):
         params = parameters_for_format(".pdf", tmp_path / "a.pdf")
@@ -62,7 +77,7 @@ class TestSupported:
         assert parameters_for_format(".csv", sample)["delimiter"] == ";"
 
     def test_unsupported_raises_422_error(self, parser, tmp_path):
-        path = tmp_path / "doc.doc"
+        path = tmp_path / "doc.pptx"
         path.write_bytes(b"fake")
         with pytest.raises(UnsupportedFormatError):
             parser.parse(path)
@@ -281,12 +296,136 @@ class TestErrors:
             parser.parse(invalid_files["broken_docx"])
 
     def test_doc_rejected(self, parser, tmp_path):
-        path = tmp_path / "old.doc"
+        path = tmp_path / "old.pptx"
         path.write_bytes(b"fake")
         with pytest.raises(UnsupportedFormatError):
             parser.parse(path)
 
     def test_pdf_without_text_layer(self, parser, tmp_path):
         path = _build_pdf([[]], None, tmp_path / "empty_page.pdf")
-        with pytest.raises(DocumentParseError, match="текстового слоя"):
+        with pytest.raises(OcrDisabledError, match="текстового слоя"):
+            parser.parse(path)
+
+    def test_ocr_disabled_is_document_parse_error(self):
+        """Подтип сохраняет совместимость с общим обработчиком 400."""
+        assert issubclass(OcrDisabledError, DocumentParseError)
+        error = OcrDisabledError(filename="scan.pdf")
+        assert error.message == OcrDisabledError.MESSAGE
+        assert "OCR отключён" in error.message
+        assert error.filename == "scan.pdf"
+
+
+class TestNewFormats:
+    """Форматы, добавленные в Этапе 1: .doc/.odt/.rtf/.xml/.md."""
+
+    INPUT_DIR = Path(__file__).resolve().parent.parent.parent / "input"
+
+    def _require(self, name: str) -> Path:
+        path = self.INPUT_DIR / name
+        if not path.exists():
+            pytest.skip(f"{name} отсутствует в input/")
+        return path
+
+    @pytest.mark.parametrize(
+        "name", ["gost_report.doc", "gost_report.odt", "gost_report.rtf"]
+    )
+    def test_libreoffice_formats(self, parser, name):
+        result = parser.parse(self._require(name))
+        assert result.markdown.strip()
+        assert_valid_markdown(result.markdown)
+
+    @pytest.mark.parametrize(
+        "name", ["gost_report.docx", "gost_report.odt", "gost_report.rtf"]
+    )
+    def test_word_family_identical_output(self, parser, name):
+        """DOCX/ODT/RTF — один документ в трёх обёртках: результат совпадает."""
+        reference = parser.parse(self._require("gost_report.docx")).markdown
+        result = parser.parse(self._require(name)).markdown
+        assert result == reference
+
+    def test_markdown_alias_copied_to_txt(self, parser, monkeypatch, tmp_path):
+        """.md копируется в .txt: dedoc не читает markdown нативно."""
+        from rag_parser.parsers.dedoc_parser import prepare_for_parsing
+
+        source = self._require("gost_report.md")
+        aliased, extension, temporary = prepare_for_parsing(source)
+        try:
+            assert extension == ".txt"
+            assert temporary is not None and temporary.exists()
+            assert temporary.suffix == ".txt"
+            assert aliased.read_bytes() == source.read_bytes()
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def test_markdown_parses(self, parser):
+        result = parser.parse(self._require("gost_report.md"))
+        assert result.markdown.strip()
+        assert_valid_markdown(result.markdown)
+
+    def test_xml_parses(self, parser):
+        result = parser.parse(self._require("gost_report.xml"))
+        assert result.markdown.strip()
+        assert_valid_markdown(result.markdown)
+
+    def test_odt_returns_tables(self, parser):
+        result = parser.parse(self._require("gost_report.odt"))
+        assert result.metadata["tables"] >= 1
+
+    def test_temp_alias_file_cleaned_up(self, parser):
+        """Временная .txt-копия не должна оставаться в temp."""
+        from rag_parser.core.config import settings
+
+        temp_dir = Path(settings.TEMP_DIR)
+        stem = "gost_report"
+        leftovers = (
+            list(temp_dir.glob(f"{stem}.txt")) if temp_dir.exists() else []
+        )
+        parser.parse(self._require("gost_report.md"))
+        remaining = (
+            [p for p in temp_dir.glob(f"{stem}.txt") if p not in leftovers]
+            if temp_dir.exists()
+            else []
+        )
+        assert not remaining, f"временные файлы не удалены: {remaining}"
+
+
+class TestLibreOfficeGuard:
+    def test_available_flag_matches_path(self):
+        import shutil
+
+        from rag_parser.parsers.dedoc_parser import libreoffice_available
+
+        expected = (
+            shutil.which("soffice") is not None
+            or shutil.which("libreoffice") is not None
+        )
+        assert libreoffice_available() is expected
+
+    def test_missing_libreoffice_gives_clear_error(self, monkeypatch, tmp_path):
+        from rag_parser.parsers import dedoc_parser as module
+
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        path = tmp_path / "doc.odt"
+        path.write_bytes(b"fake")
+        with pytest.raises(DocumentParseError, match="LibreOffice"):
+            module.require_libreoffice(".odt", path.name)
+
+    def test_guard_silent_for_non_libreoffice_formats(self, monkeypatch):
+        from rag_parser.parsers import dedoc_parser as module
+
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        for extension in (".docx", ".pdf", ".txt", ".md", ".xlsx"):
+            module.require_libreoffice(extension, "any.bin")
+
+    def test_container_signature_rejects_fake_odt(self, parser, tmp_path):
+        path = tmp_path / "fake.odt"
+        path.write_bytes(b"not a zip container at all")
+        with pytest.raises(DocumentParseError, match="does not match"):
+            parser.parse(path)
+
+    def test_container_signature_rejects_fake_doc(self, parser, tmp_path):
+        path = tmp_path / "fake.doc"
+        path.write_bytes(b"not an OLE2 container")
+        with pytest.raises(DocumentParseError, match="does not match"):
             parser.parse(path)

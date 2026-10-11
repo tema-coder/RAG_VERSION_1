@@ -16,8 +16,7 @@ class ParseRequest(BaseModel):
     chunking_type: ChunkingType = ChunkingType.NONE
     chunk_size: int = Field(default=500, ge=100, le=2000)
     overlap: int = Field(default=50, ge=0, le=500)
-    table_chunk_size: int = Field(default=5, ge=1, le=50)
-    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    threshold: float = Field(default=0.5, gt=0.0, lt=1.0)
     header_threshold: float = Field(default=4.0, ge=0.0, le=8.0)
 
 
@@ -29,6 +28,8 @@ class ChunkResponse(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     text_for_embedding: Optional[str] = None
     breadcrumb: Optional[str] = None
+    parent_id: Optional[str] = None
+    chunk_order: int = 0
 
 
 class TreeNode(BaseModel):

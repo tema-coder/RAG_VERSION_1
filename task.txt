@@ -1,0 +1,115 @@
+MASTER TASK (Финальная сборка): RAG Parser Service (Branch: test_dedoc_2.0)
+🧑‍💻 Роль и контекст
+Ты — старший Python-разработчик. Твоя задача — с нуля создать (или финализировать) модульный монолитный бэкенд-сервис rag_parser для парсинга структурированных документов, построения их дерева и гибридного чанкинга. Единственным движком парсинга является библиотека dedoc. Архитектура включает дерево документа, breadcrumb-обогащение, forward-fill для Excel и строгую Child-Parent логику выдачи.
+🚫 ЖЁСТКИЕ ОГРАНИЧЕНИЯ
+Только CPU. Никаких GPU-зависимостей в коде, без OCR.
+Python 3.10–3.11.
+Форматы (строго 12): .docx, .doc, .odt, .rtf, .html, .htm, .txt, .xml, .md, .pdf, .csv, .xlsx, .xls. Любые другие (.pptx, .epub, сканы) → HTTP 422.
+PDF: Только текстовый слой. Если слоя нет → 422 «OCR отключён».
+LibreOffice: Для парсинга .doc, .odt, .rtf библиотека dedoc требует наличия LibreOffice в системе. В README и коде должен быть учтён этот факт.
+Чистый старт: Не ссылайся на удаление старых библиотек (markitdown/calamine), просто используй предоставленный стек.
+📦 1. Стек и зависимости (requirements.txt)
+Создай requirements.txt со следующими версиями:
+dedoc==2.8
+fastapi==0.104.1
+uvicorn[standard]==0.23.2
+python-multipart==0.0.6
+pydantic>=2.5.3,<3
+pydantic-settings>=2.0
+tiktoken==0.7.0
+chonkie==1.3.1
+sentence-transformers>=3.0
+tqdm
+aiofiles==24.1.0
+httpx==0.27.2
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov
+structlog==24.4.0
+python-dotenv==1.0.1
+python-magic==0.4.27
+orjson==3.10.7
+openpyxl
+python-docx==0.8.11
+xlwt
+
+Действие агента: Создать venv, выполнить pip install, убедиться, что from dedoc import DedocManager работает.
+2. Структура проекта
+Создай следующую структуру (папки input/ и output/ добавить в .gitignore):
+text
+rag_parser/
+├── api/                 # routes.py, schemas.py, dependencies.py
+├── parsers/             # base.py, dedoc_parser.py, dedoc_tree.py, merged_cells.py, header_promoter.py
+├── chunkers/            # base.py, token.py, sentence.py, semantic.py, recursive.py, table.py, breadcrumb.py, hybrid.py
+├── frontend/            # app.py (Streamlit)
+├── core/                # config.py, interfaces.py
+├── scripts/             # generate_test_doc.py, process_input_folder.py (НОВЫЙ)
+├── tests/               # Полный набор тестов
+├── input/               # Исходные файлы для пакетной обработки (в .gitignore)
+├── output/              # Результаты парсинга и .md файлы (в .gitignore)
+├── test_data/           # Фикстуры
+├── main.py
+├── requirements.txt
+├── .env.example
+└── README.md
+3. Ключевая логика компонентов (КРИТИЧНО)
+3.1. Грабли API dedoc==2.8 (Обязательно учесть в dedoc_tree.py)
+Текст строки: line.line, НЕ line.text. Может быть вложенным LineWithMeta — раскрывать рекурсивно.
+Тип и уровень: line.metadata.data["paragraph_type"] и line.metadata.data["hierarchy_level"] (объект с полями level_1, level_2, line_type). Атрибутов line.type / line.level не существует.
+Заголовки в dedoc называются "header", не "heading".
+Ячейка таблицы: CellWithMeta, у неё нет атрибута .text. Текст доставать через cell.get_text() или обход cell.lines → ln.line. Запрещено использовать str(cell).
+3.2. Breadcrumb и Вложенность (ПРАВИЛО 2-Х УРОВНЕЙ)
+Путь заголовков от корня до родителя чанка, разделитель " > ".
+Жёсткое ограничение глубины: максимум 2 последних уровня вложенности.
+Если структура 1.1 → 1.1.1, берем оба: "[1.1 Название > 1.1.1 Название] текст".
+Если структура 1.1 → 1.1.1 → 1.1.1.1, берем только два последних: "[1.1.1 Название > 1.1.1.1 Название] текст".
+Если над чанком нет ни одного заголовка, breadcrumb = None.
+3.3. Обработка таблиц (СТРОГИЕ ПРАВИЛА)
+Позиционная целостность: Таблицы не должны "укатываться" в конец документа. Они остаются в том узле дерева, где были в оригинале.
+Заголовок таблицы: У таблицы должен быть реальный заголовок (ближайший preceding header или caption). К этому заголовку также применяется правило "максимум 2 последних уровня" для breadcrumb.
+Размер чанка таблицы: ЖЁСТКОЕ требование. Все таблицы обрабатываются строго по 1 строке данных за раз (без параметров выбора количества строк). Каждый чанк таблицы содержит: заголовок таблицы + 1 строку данных.
+Dual representation: text = Markdown (с |), text_for_embedding = естественный язык ("Заголовок1: значение1, ...") без символов |, с префиксом [breadcrumb].
+3.4. Child-Parent логика для Retrieval (НОВОЕ)
+Каждому чанку присваивается parent_id (уникальный ID ближайшего/последнего заголовка, к которому относится чанк).
+Каждому чанку присваивается chunk_order (порядковый номер внутри этого родителя).
+Логика поиска:
+Если у найденного чанка ЕСТЬ parent_id, система возвращает ВСЕ чанки с этим parent_id, отсортированные по возрастанию chunk_order.
+Если у найденного чанка НЕТ parent_id (в документе не было заголовков), система возвращает ТОЛЬКО этот единственный найденный чанк.
+3.5. HeaderPromoter и MergedCells
+HeaderPromoter: Скоринг узлов дерева ДО генерации Markdown. Баллы: Regex нумерации (+3), bold=True (+2), size > 14 (+1.5), КАПС (+1), длина < 100 (+1), alignment=center (+0.5), предложение с точкой и >120 симв (-2). Порог HEADER_PROMOTION_THRESHOLD (дефолт 4.0).
+MergedCells: Forward-fill для таблиц xlsx/xls. Значение из левой/верхней ячейки диапазона копируется вправо и вниз внутри объединенного диапазона.
+3.6. Скрипт пакетной обработки (scripts/process_input_folder.py)
+Сканирует папку input/ и находит все файлы с поддерживаемыми расширениями.
+Для каждого файла запускает полный пайплайн: DedocParser -> HybridRagChunker.
+Сохраняет результаты в папку output/ с понятными именами:
+output/{имя_файла}_parsed.md (итоговый Markdown)
+output/{имя_файла}_chunks.json (чанки с breadcrumb, parent_id, chunk_order)
+output/{имя_файла}_tree.json (структурное дерево)
+Использует tqdm для прогресс-бара. При ошибке парсинга одного файла логирует её и переходит к следующему.
+📋 4. Порядок выполнения (Step-by-Step)
+Выполняй строго по порядку. После каждого этапа проверяй синтаксис.
+Инициализация: Создай структуру директорий и requirements.txt. В README укажи необходимость системной установки libreoffice (например, sudo apt install libreoffice).
+Ядро: Реализуй core/config.py и core/interfaces.py (с новыми полями parent_id, chunk_order, breadcrumb).
+DedocTree: Реализуй parsers/dedoc_tree.py с учетом всех "граблей" API.
+MergedCells: Реализуй parsers/merged_cells.py и создай fixture test_data/merged_cells.xlsx через openpyxl.
+HeaderPromoter: Реализуй parsers/header_promoter.py и создай 2 fixture через python-docx (со стилями и без).
+DedocParser: Собери единый парсер, сохранение на диск, применение MergedCells.
+Breadcrumb + Hybrid: Реализуй chunkers/breadcrumb.py (правило 2-х уровней) и обнови chunkers/hybrid.py (жесткий чанкинг таблиц по 1 строке, dual representation, привязка parent_id/chunk_order).
+API: Обнови schemas.py (TreeNode) → dependencies.py → routes.py.
+Streamlit UI: Реализуй frontend/app.py с вкладкой "Дерево", слайдером порога и скачиванием.
+Скрипт пакетной обработки: Напиши scripts/process_input_folder.py для обработки папки input/ с сохранением .md в output/.
+Тесты: Напиши все тесты. Покрытие parsers/ и chunkers/ ≥ 80%. Обязательно протестируй правило 2-х уровней вложенности, 1 строку в таблице и Child-Parent логику.
+Документация: Создай README.md (инструкция установки LibreOffice, таблица форматов, описание Child-Parent) и .env.example.
+✅ 5. Критерии приёмки (Acceptance Criteria)
+pip install -r requirements.txt проходит. В README есть инструкция по установке libreoffice.
+Все 12 форматов успешно парсятся. Неподдерживаемые форматы возвращают 422.
+ParseResponse.tree непустое: заголовки type="header", text ≤ 31 символ.
+Breadcrumb в чанках строго содержит максимум 2 последних уровня заголовков.
+Таблицы не смещаются вниз, их чанки содержат заголовок + ровно 1 строку данных. text_for_embedding таблицы не содержит символов |.
+Child-Parent логика работает: чанки с parent_id группируются при выдаче, чанки без parent_id выдаются поодиночке.
+Скрипт process_input_folder.py успешно обрабатывает файлы из папки input/ и создает корректные .md и .json файлы в папке output/.
+Слайдер порога в UI работает.
+pytest зелёный, покрытие ≥ 80%.
+❓ Контрольные вопросы (если что-то неясно — остановись и уточни, не выдумывай)
+Подтверждено ли правило: для таблиц используется заголовок + 1 строка данных, а NL-представление таблицы (text_for_embedding) выглядит как "Заголовок1: val1, Заголовок2: val2" без символов |?
+Подтверждено ли, что при отсутствии заголовков в документе (parent_id = None) поисковая выдача возвращает только сам найденный чанк, без агрегации?

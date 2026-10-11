@@ -1,9 +1,25 @@
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
+
+# Покрытие
 .coverage
 htmlcov/
-*.egg-info/
+
+# Локальное окружение и секреты
 .env
+venv/
+rag_parser/venv/
+.venv/
+
+# Временные файлы парсера (dedoc, конвертации, загрузки)
 temp/
+
+# Входные данные и результаты пакетной обработки.
+# Фикстуры намеренно НЕ игнорируются — они лежат в rag_parser/test_data/
+# и должны отслеживаться репозиторием.
+input/
+output/
 rag_parser/output/

@@ -34,9 +34,49 @@ class TestFormat:
         assert SEPARATOR == " > "
         assert breadcrumb_for_path(["A", "B"]) == "A > B"
 
-    def test_last_three_levels(self):
-        crumb = breadcrumb_for_path(["H1", "H2", "H3", "H4"])
-        assert crumb == "H2 > H3 > H4"
+    def test_max_depth_is_two_by_default(self):
+        """ТЗ 3.2: жёсткое ограничение — максимум 2 последних уровня."""
+        from rag_parser.core.config import settings
+
+        assert settings.BREADCRUMB_MAX_DEPTH == 2
+
+    def test_last_two_levels(self):
+        """Из 4 уровней в крошку попадают строго последние два."""
+        assert breadcrumb_for_path(["H1", "H2", "H3", "H4"]) == "H3 > H4"
+
+    def test_tz_case_two_levels(self):
+        """ТЗ: 1.1 -> 1.1.1 — оба уровня попадают в крошку."""
+        crumb = breadcrumb_for_path(["1.1 Название", "1.1.1 Название"])
+        assert crumb == "1.1 Название > 1.1.1 Название"
+
+    def test_tz_case_three_levels_takes_last_two(self):
+        """ТЗ: 1.1 -> 1.1.1 -> 1.1.1.1 — берутся только два последних."""
+        crumb = breadcrumb_for_path(
+            ["1.1 Название", "1.1.1 Название", "1.1.1.1 Название"]
+        )
+        assert crumb == "1.1.1 Название > 1.1.1.1 Название"
+        # Проверяем по частям: подстрока "1.1 Название" входит в
+        # "1.1.1 Название", поэтому сравниваем именно сегменты.
+        assert crumb.split(SEPARATOR) == ["1.1.1 Название", "1.1.1.1 Название"]
+        assert len(crumb.split(SEPARATOR)) == 2
+
+    def test_tz_case_four_levels_takes_last_two(self):
+        crumb = breadcrumb_for_path(["1.1", "1.1.1", "1.1.1.1", "1.1.1.1.1"])
+        assert crumb == "1.1.1.1 > 1.1.1.1.1"
+
+    def test_single_level(self):
+        assert breadcrumb_for_path(["Только один"]) == "Только один"
+
+    def test_depth_one_keeps_only_last(self):
+        """Явная глубина 1 — в крошке остаётся один последний уровень."""
+        assert breadcrumb_for_path(["H1", "H2", "H3"], max_depth=1) == "H3"
+
+    def test_depth_zero_disables_limit(self):
+        """max_depth <= 0 — ограничение выключено, берётся весь путь."""
+        assert (
+            breadcrumb_for_path(["H1", "H2", "H3"], max_depth=0)
+            == "H1 > H2 > H3"
+        )
 
     def test_short_path_whole(self):
         assert breadcrumb_for_path(["A", "B"]) == "A > B"
@@ -44,6 +84,9 @@ class TestFormat:
     def test_empty_none(self):
         assert breadcrumb_for_path([]) is None
         assert enrich_text("text", None) == "text"
+
+    def test_blank_headers_skipped(self):
+        assert breadcrumb_for_path(["A", "  ", "B", ""]) == "A > B"
 
     def test_enrich_format(self):
         assert enrich_text("текст", "Раздел 2 > 2.3 Основные показатели") == \

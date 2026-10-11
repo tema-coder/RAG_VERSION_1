@@ -1,10 +1,23 @@
-"""Единый парсер документов через ``dedoc`` (9 форматов).
+"""Единый парсер документов через ``dedoc`` (14 форматов).
 
 ``DedocManager.parse(file_path, parameters={...})`` сам выбирает ридер по
 расширению. Используется урезанный ``manager_config`` (только нужные
 ридеры/конвертеры, PDF — только текстовый слой): дефолтная конфигурация
 поднимает все ридеры dedoc, включая ``PdfImageReader`` (torchvision, OCR),
 что запрещено ограничениями (только CPU, без OCR).
+
+Требования к форматам:
+
+* ``.doc`` / ``.odt`` / ``.rtf`` — dedoc конвертирует их в DOCX вызовом
+  ``soffice --headless``, поэтому в системе должен стоять LibreOffice
+  (``sudo apt install libreoffice``). Без него эти форматы не читаются;
+* ``.xml`` — читается ``RawTextReader`` (dedoc относит XML к txt-подобным);
+* ``.md`` — нативно dedoc не знает. Файл копируется во временный ``.txt``
+  и парсится как обычный текст: полагаться на то, что dedoc сам откатится
+  с ``text/markdown`` на ``text/plain``, нельзя — это недокументированное
+  поведение, и оно молча ломает разбор при смене версии dedoc;
+* ``.xls`` — конвертируется в ``.xlsx`` через ``xlrd``+``openpyxl``,
+  чтобы не зависеть от LibreOffice наlegacy-файлах.
 
 Артефакты на диске (``output/dedoc_results/``):
 
@@ -13,6 +26,7 @@
 """
 
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,21 +35,36 @@ import orjson
 from rag_parser.core.interfaces import (
     BaseParser,
     DocumentParseError,
+    OcrDisabledError,
     ParseResult,
     UnsupportedFormatError,
 )
 
 SUPPORTED_EXTENSIONS: List[str] = [
     ".docx",
+    ".doc",
+    ".odt",
+    ".rtf",
     ".xlsx",
     ".xls",
+    ".csv",
+    ".tsv",
     ".pdf",
     ".html",
     ".htm",
     ".txt",
-    ".csv",
-    ".tsv",
+    ".xml",
+    ".md",
 ]
+
+#: Расширения, которые dedoc не умеет читать нативно и которые мы
+#: подменяем на ``.txt`` перед разбором (см. ``prepare_for_parsing``).
+TEXT_ALIAS_EXTENSIONS: Dict[str, str] = {
+    ".md": ".txt",
+}
+
+#: Расширения, требующие LibreOffice (конвертация в DOCX средствами dedoc).
+LIBREOFFICE_EXTENSIONS = (".doc", ".odt", ".rtf")
 
 TREE_FILE_PREFIX = "raw_dedoc_tree"
 MARKDOWN_FILE_PREFIX = "parsed"
@@ -151,6 +180,66 @@ def get_manager() -> Any:
     return _manager
 
 
+def prepare_manager_for_format(extension: str) -> Any:
+    """Возвращает менеджер, готовый к разбору указанного формата.
+
+    Для PDF дополнительно ставится защита bbox: dedoc 2.8 роняет разбор
+    страниц, у которых координаты текста выходят за границы рендера
+    (см. ``parsers.pdf_bbox_guard``). Для остальных форматов менеджер
+    возвращается как есть.
+    """
+    manager = get_manager()
+    if str(extension).lower() == ".pdf":
+        from rag_parser.parsers.pdf_bbox_guard import install_bbox_guard
+
+        install_bbox_guard()
+    return manager
+
+
+def libreoffice_available() -> bool:
+    """Есть ли ``soffice`` в PATH (нужен для .doc/.odt/.rtf)."""
+    return shutil.which("soffice") is not None or shutil.which("libreoffice") is not None
+
+
+def require_libreoffice(extension: str, filename: str) -> None:
+    """Диагностика для .doc/.odt/.rtf без установленного LibreOffice.
+
+    Без ``soffice`` dedoc не может сконвертировать файл в DOCX и падает
+    невнятной ошибкой в глубине конвертера. Здесь сообщаем точную причину.
+    """
+    if extension.lower() not in LIBREOFFICE_EXTENSIONS:
+        return
+    if libreoffice_available():
+        return
+    raise DocumentParseError(
+        f"Формат {extension} требует LibreOffice (soffice) для конвертации в "
+        "DOCX. Установите его: sudo apt install libreoffice",
+        filename=filename,
+    )
+
+
+def prepare_for_parsing(path: Path) -> Tuple[Path, str, Optional[Path]]:
+    """Готовит файл к разбору dedoc.
+
+    Возвращает ``(путь_для_dedoc, расширение_для_dedoc, временный_файл)``.
+
+    Для форматов из ``TEXT_ALIAS_EXTENSIONS`` (``.md``) делается копия с
+    расширением ``.txt`` — dedoc такие файлы не умеет. Вызывающий обязан
+    удалить ``временный_файл`` (если он не ``None``) в ``finally``.
+    """
+    extension = path.suffix.lower()
+    alias = TEXT_ALIAS_EXTENSIONS.get(extension)
+    if alias is None:
+        return path, extension, None
+
+    from rag_parser.core.config import settings
+
+    target_dir = settings.ensure_temp_dir()
+    alias_path = target_dir / f"{path.stem}{alias}"
+    shutil.copyfile(path, alias_path)
+    return alias_path, alias, alias_path
+
+
 def dedoc_version() -> str:
     try:
         import dedoc.version
@@ -257,6 +346,12 @@ _CONTAINER_SIGNATURES = {
     ".docx": (b"PK\x03\x04", "ZIP (OOXML)"),
     ".xlsx": (b"PK\x03\x04", "ZIP (OOXML)"),
     ".pdf": (b"%PDF", "PDF"),
+    # Legacy OLE2-контейнер (OLE2 signature, D0CF11E0A1B11AE1)
+    ".doc": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "OLE2"),
+    ".xls": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "OLE2"),
+    # ODF — ZIP-подобный контейнер, но с mimetype-членом вперемешку;
+    # проверяем ZIP-заголовок, полная валидация — забота LibreOffice.
+    ".odt": (b"PK\x03\x04", "ZIP (ODF)"),
 }
 
 
@@ -298,8 +393,11 @@ class DedocParser(BaseParser):
             raise UnsupportedFormatError(extension, SUPPORTED_EXTENSIONS)
 
         self._validate_container(path, extension)
+        require_libreoffice(extension, path.name)
 
-        # Legacy .xls dedoc умеет только через LibreOffice — конвертируем сами.
+        # Подготовка пути: .xls -> .xlsx своей конвертацией, .md -> .txt
+        # (dedoc не знает markdown; полагаться на его недокументированный
+        # откат text/markdown -> text/plain нельзя).
         converted: Optional[Path] = None
         effective_path = path
         effective_extension = extension
@@ -307,10 +405,16 @@ class DedocParser(BaseParser):
             converted = convert_xls_to_xlsx(path)
             effective_path = converted
             effective_extension = ".xlsx"
+        else:
+            effective_path, effective_extension, alias_copy = prepare_for_parsing(path)
+            if alias_copy is not None:
+                converted = alias_copy
 
         try:
-            manager = get_manager()
+            manager = prepare_manager_for_format(effective_extension)
         except ImportError as exc:
+            if converted is not None:
+                converted.unlink(missing_ok=True)
             raise DocumentParseError(
                 f"dedoc is not installed: {exc}", filename=path.name
             ) from exc
@@ -357,10 +461,9 @@ class DedocParser(BaseParser):
 
         if not markdown.strip():
             if extension == ".pdf":
-                raise DocumentParseError(
-                    "PDF без текстового слоя не поддерживается, OCR отключён",
-                    filename=path.name,
-                )
+                # Отдельный подтип: OCR отключён по условиям задачи, это
+                # осознанный отказ (HTTP 422), а не сбой разбора (400).
+                raise OcrDisabledError(filename=path.name)
             raise DocumentParseError(
                 "Converted document contains no text", filename=path.name
             )
@@ -449,5 +552,9 @@ __all__ = [
     "dedoc_version",
     "detect_text_encoding",
     "get_manager",
+    "libreoffice_available",
     "parameters_for_format",
+    "prepare_for_parsing",
+    "prepare_manager_for_format",
+    "require_libreoffice",
 ]

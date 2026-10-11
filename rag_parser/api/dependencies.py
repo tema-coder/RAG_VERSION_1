@@ -35,12 +35,18 @@ MIME_ALLOWLIST = {
     "text/markdown",
     "text/html",
     "text/x-csv",
+    "text/xml",
+    "application/xml",
+    "text/x-markdown",
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-excel",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/x-ole-storage",  # legacy .xls (BIFF)
-    "application/msword",  # на всякий случай рядом с ole-storage
+    "application/x-ole-storage",  # legacy .xls (BIFF) и .doc
+    "application/msword",
+    "application/vnd.oasis.opendocument.text",  # .odt
+    "text/rtf",  # .rtf
+    "application/rtf",
     "application/zip",
     "application/octet-stream",
     "inode/x-empty",
@@ -69,7 +75,6 @@ def get_chunker(
     overlap: Optional[int] = None,
     source: str = "document",
     threshold: Optional[float] = None,
-    table_chunk_size: Optional[int] = None,
 ) -> Optional[BaseChunker]:
     if chunking_type == ChunkingType.NONE:
         return None
@@ -83,7 +88,6 @@ def get_chunker(
         chunk_size=chunk_size,
         overlap=overlap,
         source=source,
-        table_chunk_size=table_chunk_size,
         threshold=threshold,
     )
 
@@ -114,7 +118,16 @@ def validate_upload(filename: str, data: bytes) -> None:
     mime = sniff_mime(data[:4096])
     if mime and mime not in MIME_ALLOWLIST:
         logger.warning("Unexpected mime type %s for %s", mime, filename)
-        if extension in (".pdf", ".docx", ".xlsx", ".xls"):
+        if extension in (
+            ".pdf",
+            ".docx",
+            ".xlsx",
+            ".xls",
+            ".doc",
+            ".odt",
+            ".rtf",
+            ".xml",
+        ):
             raise DocumentParseError(
                 f"File content does not match extension {extension} (detected {mime})",
                 filename=filename,

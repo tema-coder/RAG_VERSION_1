@@ -1,5 +1,6 @@
+import itertools
 import re
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from rag_parser.chunkers.base import BaseChunker, Chunk
 from rag_parser.chunkers.breadcrumb import breadcrumb_for_path, enrich_text
@@ -44,6 +45,8 @@ class HybridRagChunker(BaseChunker):
 
     Table chunks carry two representations: ``text`` (original Markdown for
     the LLM) and ``text_for_embedding`` (natural language for embeddings).
+    Every table chunk holds exactly ONE data row plus the table header
+    (ТЗ 3.3) — the row count is not configurable.
 
     Breadcrumb enrichment: when a (full-text) ``tree`` is passed, every
     segment is chunked with the breadcrumb of its enclosing headers;
@@ -63,7 +66,6 @@ class HybridRagChunker(BaseChunker):
         chunk_size: Optional[int] = None,
         overlap: Optional[int] = None,
         source: str = "document",
-        table_chunk_size: Optional[int] = None,
         threshold: Optional[float] = None,
     ) -> None:
         from rag_parser.chunkers.sentence import SentenceChunkerRAG
@@ -98,9 +100,9 @@ class HybridRagChunker(BaseChunker):
             )
         from rag_parser.chunkers.table import TableChunkerRAG
 
-        self.table_chunker = TableChunkerRAG(
-            chunk_size=table_chunk_size, source=source
-        )
+        # Размер табличного чанка НЕ настраивается: ТЗ 3.3 требует
+        # ровно одну строку данных на чанк.
+        self.table_chunker = TableChunkerRAG(source=source)
         self.chunk_size = self.text_chunker.chunk_size
         self.overlap = self.text_chunker.overlap
 
@@ -125,7 +127,14 @@ class HybridRagChunker(BaseChunker):
         extra = {key: value for key, value in metadata.items() if key != "source"}
         chunks: List[Chunk] = []
 
-        segments: List[tuple] = []  # (kind, segment_text, breadcrumb)
+        segments: List[tuple] = []  # (kind, segment_text, crumb, parent_id)
+
+        # Детерминированные id заголовков: h_1, h_2, ... по порядку обхода.
+        # Порядковый номер не зависит от текста заголовка, поэтому повторный
+        # разбор того же документа даёт те же id (проверяется тестом).
+        header_counter = itertools.count(1)
+        # (id, уровень) — стек открытых заголовков; верхний = ближайший родитель.
+        header_stack: List[tuple] = []
 
         def visit(node: DocumentNode, trail: List[str]) -> None:
             crumb = breadcrumb_for_path(trail)
@@ -133,30 +142,62 @@ class HybridRagChunker(BaseChunker):
                 for child in node.children:
                     visit(child, trail)
             elif node.type == "header":
-                if (node.text or "").strip():
-                    segments.append(("text", node.text.strip(), crumb))
-                child_trail = [*trail, node.text.strip()] if (node.text or "").strip() else trail
-                for child in node.children:
-                    visit(child, child_trail)
-            elif node.type == "table":
-                if (node.text or "").strip():
-                    segments.append(("table", node.text.strip(), crumb))
-            else:  # paragraph / list_item / raw_text
-                if (node.text or "").strip():
-                    segments.append(("text", node.text.strip(), crumb))
+                title = (node.text or "").strip()
+                if title:
+                    header_id = f"h_{next(header_counter)}"
+                    # Заголовок входит в свой собственный раздел: его текст —
+                    # первый чанк этого родителя.
+                    segments.append(("text", title, crumb, header_id))
+                    # Уровень узла задаёт вложенность: снимаем более глубокие.
+                    level = node.level if isinstance(node.level, int) else len(header_stack) + 1
+                    while header_stack and header_stack[-1][1] >= level:
+                        header_stack.pop()
+                    header_stack.append((header_id, level))
+                    for child in node.children:
+                        visit(child, [*trail, title])
+                    return
+                # Заголовок без текста — не становится родителем.
                 for child in node.children:
                     visit(child, trail)
+            elif node.type == "table":
+                if (node.text or "").strip():
+                    segments.append(
+                        ("table", node.text.strip(), crumb, current_parent())
+                    )
+            else:  # paragraph / list_item / raw_text
+                if (node.text or "").strip():
+                    segments.append(("text", node.text.strip(), crumb, current_parent()))
+                for child in node.children:
+                    visit(child, trail)
+
+        def current_parent() -> Optional[str]:
+            return header_stack[-1][0] if header_stack else None
 
         visit(tree, [])
         if not segments:
             # Пустое дерево — откат к Markdown-пути.
             return self._chunk_markdown(text, metadata)
 
-        for kind, segment_text, crumb in segments:
+        # Порядковый номер внутри родителя: счётчик перезапускается при
+        # смене parent_id, поэтому у каждого заголовка нумерация с 0.
+        # Важно: один сегмент может дать НЕСКОЛЬКО чанков (таблица режется
+        # по одной строке), поэтому счётчик двигается на число реально
+        # созданных чанков, а не на один.
+        orders: Dict[str, int] = {}
+        for kind, segment_text, crumb, parent_id in segments:
+            before = len(chunks)
             if kind == "table":
-                self._emit_table(segment_text, source, extra, chunks, crumb)
+                self._emit_table(
+                    segment_text, source, extra, chunks, crumb, parent_id,
+                    orders.get(parent_id, 0) if parent_id is not None else 0,
+                )
             else:
-                self._emit_text(segment_text, source, extra, chunks, crumb)
+                self._emit_text(
+                    segment_text, source, extra, chunks, crumb, parent_id,
+                    orders.get(parent_id, 0) if parent_id is not None else 0,
+                )
+            if parent_id is not None:
+                orders[parent_id] = orders.get(parent_id, 0) + (len(chunks) - before)
         return chunks
 
     # ------------------------------------------------------------------
@@ -170,6 +211,21 @@ class HybridRagChunker(BaseChunker):
         extra = {key: value for key, value in metadata.items() if key != "source"}
         chunks: List[Chunk] = []
         stack: List[tuple] = []  # (level, header_text)
+        header_counter = itertools.count(1)
+        parent_stack: List[tuple] = []  # (id, level) — как в tree-пути
+        orders: Dict[str, int] = {}
+
+        def next_order(parent_id: Optional[str]) -> int:
+            if parent_id is None:
+                return 0
+            order = orders.get(parent_id, 0)
+            orders[parent_id] = order + 1
+            return order
+
+        def next_order_after(parent_id: Optional[str], produced: int) -> None:
+            """Сдвинуть счётчик на число реально созданных чанков сегмента."""
+            if parent_id is not None:
+                orders[parent_id] = orders.get(parent_id, 0) + produced
 
         for block in BLOCK_SPLIT_RE.split(text):
             if not block.strip():
@@ -185,23 +241,42 @@ class HybridRagChunker(BaseChunker):
             ]:
                 # Блок только из заголовков: чанки — с крошкой предков.
                 crumb = breadcrumb_for_path([item[1] for item in stack])
-                for _, header_text in headers_in_block:
-                    self._emit_text(header_text, source, extra, chunks, crumb)
                 for level, header_text in headers_in_block:
                     while stack and stack[-1][0] >= level:
                         stack.pop()
+                    while parent_stack and parent_stack[-1][1] >= level:
+                        parent_stack.pop()
                     stack.append((level, header_text))
+                    header_id = f"h_{next(header_counter)}"
+                    parent_stack.append((header_id, level))
+                    # Заголовок — первый чанк своего же раздела.
+                    self._emit_text(
+                        header_text, source, extra, chunks, crumb,
+                        header_id, next_order(header_id),
+                    )
                 continue
             for level, header_text in headers_in_block:
                 while stack and stack[-1][0] >= level:
                     stack.pop()
+                while parent_stack and parent_stack[-1][1] >= level:
+                    parent_stack.pop()
                 stack.append((level, header_text))
+                parent_stack.append((f"h_{next(header_counter)}", level))
             crumb = breadcrumb_for_path([item[1] for item in stack])
+            parent_id = parent_stack[-1][0] if parent_stack else None
             for kind, part in _split_block(block):
+                before = len(chunks)
                 if kind == "table":
-                    self._emit_table(part, source, extra, chunks, crumb)
+                    self._emit_table(
+                        part, source, extra, chunks, crumb,
+                        parent_id, orders.get(parent_id, 0) if parent_id else 0,
+                    )
                 else:
-                    self._emit_text(part, source, extra, chunks, crumb)
+                    self._emit_text(
+                        part, source, extra, chunks, crumb,
+                        parent_id, orders.get(parent_id, 0) if parent_id else 0,
+                    )
+                next_order_after(parent_id, len(chunks) - before)
         return chunks
 
     # ------------------------------------------------------------------
@@ -212,8 +287,13 @@ class HybridRagChunker(BaseChunker):
         extra: dict,
         chunks: List[Chunk],
         breadcrumb: Optional[str],
+        parent_id: Optional[str] = None,
+        chunk_order: int = 0,
     ) -> None:
         cleaned = _clean_table_header(table_text)
+        # Строки одной таблицы идут подряд и принадлежат одному родителю,
+        # поэтому нумерация продолжается, а не перезапускается с 0.
+        order = chunk_order
         for table_chunk in self.table_chunker.chunk(
             cleaned, {"source": source, **extra}
         ):
@@ -221,6 +301,12 @@ class HybridRagChunker(BaseChunker):
             table_chunk.metadata["chunk_index"] = len(chunks)
             table_chunk.index = len(chunks)
             table_chunk.breadcrumb = breadcrumb
+            table_chunk.parent_id = parent_id
+            table_chunk.chunk_order = order
+            if parent_id is not None:
+                table_chunk.metadata["parent_id"] = parent_id
+                table_chunk.metadata["chunk_order"] = order
+            order += 1
             if breadcrumb:
                 table_chunk.metadata["breadcrumb"] = breadcrumb
                 table_chunk.text = enrich_text(table_chunk.text, breadcrumb)
@@ -237,7 +323,10 @@ class HybridRagChunker(BaseChunker):
         extra: dict,
         chunks: List[Chunk],
         breadcrumb: Optional[str],
+        parent_id: Optional[str] = None,
+        chunk_order: int = 0,
     ) -> None:
+        order = chunk_order
         for text_chunk in self.text_chunker.chunk(
             part, {"source": source, **extra}
         ):
@@ -245,6 +334,12 @@ class HybridRagChunker(BaseChunker):
             text_chunk.metadata["chunk_index"] = len(chunks)
             text_chunk.index = len(chunks)
             text_chunk.breadcrumb = breadcrumb
+            text_chunk.parent_id = parent_id
+            text_chunk.chunk_order = order
+            if parent_id is not None:
+                text_chunk.metadata["parent_id"] = parent_id
+                text_chunk.metadata["chunk_order"] = order
+            order += 1
             if breadcrumb:
                 text_chunk.metadata["breadcrumb"] = breadcrumb
                 text_chunk.text_for_embedding = enrich_text(

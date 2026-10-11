@@ -30,7 +30,6 @@ def process(
     chunk_size: int,
     overlap: int,
     threshold: float = 0.5,
-    table_chunk_size: int = 5,
     header_threshold: float = 4.0,
 ) -> dict:
     from rag_parser.chunkers.hybrid import HybridRagChunker
@@ -52,7 +51,6 @@ def process(
             overlap,
             source=upload.name,
             threshold=threshold,
-            table_chunk_size=table_chunk_size,
         )
         if chunker is not None:
             if isinstance(chunker, HybridRagChunker) and result.tree is not None:
@@ -115,7 +113,11 @@ def main() -> None:
     uploaded = st.file_uploader(
         "Загрузите документ",
         type=ACCEPTED_TYPES,
-        help="Поддерживаются: docx, xlsx, xls, pdf (только текстовый слой), html, htm, txt, csv, tsv",
+        help=(
+            "Поддерживаются: docx, doc, odt, rtf, xlsx, xls, csv, tsv, "
+            "pdf (только текстовый слой), html, htm, txt, xml, md. "
+            "Для doc/odt/rtf требуется LibreOffice."
+        ),
     )
 
     chunking_label = st.selectbox("Тип чанкинга", list(CHUNKING_LABELS.keys()))
@@ -124,9 +126,8 @@ def main() -> None:
     threshold = st.slider(
         "threshold (semantic)", 0.05, 0.95, settings.SEMANTIC_THRESHOLD, 0.05
     )
-    table_chunk_size = st.slider(
-        "table_chunk_size", 1, 50, settings.DEFAULT_TABLE_CHUNK_SIZE, 1
-    )
+    # Слайдера размера табличного чанка нет намеренно: по ТЗ 3.3 табличный
+    # чанк всегда содержит ровно одну строку данных.
     header_threshold = st.slider(
         "Порог распознавания заголовков",
         0.0,
@@ -160,7 +161,6 @@ def main() -> None:
                     chunk_size,
                     overlap,
                     threshold,
-                    table_chunk_size,
                     header_threshold,
                 )
         except DocumentError as exc:
