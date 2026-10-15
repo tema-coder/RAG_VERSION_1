@@ -1,36 +1,42 @@
-"""Эвристика промоции «визуальный заголовок → header».
+"""Детерминированное распознавание заголовков (без скоринга).
 
 Реальные docx часто оформлены без стилей Word: заголовки выделены
-визуально (bold, размер, центр, нумерация «Раздел N.»), а dedoc отдаёт их
-как ``raw_text``/``paragraph`` — иногда даже склеенными с телом в один
+визуально (шрифт побольше, КАПС, нумерация «Раздел N.»), а dedoc отдаёт
+их как ``raw_text``/``paragraph`` — иногда даже склеенными с телом в один
 многострочный узел (аннотации при этом привязаны к диапазонам символов).
-Модуль чинит это до генерации Markdown и чанкинга (проход 0 — сканы,
-затем рекурсия, затем глобальный ребилд):
+
+Модуль классифицирует такие строки ЖЁСТКИМИ правилами: совпадение хотя бы
+одного правила безусловно делает строку заголовком, никаких баллов и
+порогов нет. Это осознанный переход от «вероятностного угадывания с
+настройкой вслепую» к детерминированной классификации.
+
+Правила (любое одно совпадение -> заголовок):
+
+1. шрифт >= ``MIN_HEADER_FONT_SIZE`` (13pt) И строго больше базового
+   размера шрифта основного текста документа;
+2. структурное слово в начале: Раздел / Глава / Часть / Том / Книга;
+3. слово секции в начале: Введение / Заключение / Приложение /
+   Список литературы / Библиография (уровень 1);
+4. слово содержания в начале: Содержание / Оглавление /
+   Table of Contents / Contents;
+5. текст целиком в ВЕРХНЕМ РЕГИСТРЕ (МЕТОДОЛОГИЯ ИССЛЕДОВАНИЯ);
+6. нумерация + ВЕРХНИЙ РЕГИСТР остатка (2.3 АНАЛИЗ ДАННЫХ);
+7. числовая нумерация в начале: ``1``, ``1)``, ``1.1``, ``1.1.1`` …
+
+Уровень при нумерации: ``level = (число точек в числовой части) + 1``
+(«1» -> 1, «1.1» -> 2, «1.1.1» -> 3, «1.1.1.1» -> 4). Без нумерации
+уровень 1.
+
+Порядок работы:
 
 0. все листья режутся на строки; по порядку строк считаются distinct
-   «Раздел N» (супрессия `N)` при ≥2) и TOC-серии (≥5 подряд `Раздел N`
-   с N строго +1 — не промоутятся);
-1. каждая однострочная нода скорингуется;
-2. ноды с баллом ``>= threshold`` получают ``type="header"``;
-3. соседние непромоутнутые строки склеиваются обратно в абзацы
+   «Раздел N» (супрессия `N)` при >=2) и TOC-серии (>=5 подряд «Раздел N»
+   с N строго +1 — не распознаются как заголовки);
+1. каждая однострочная нода классифицируется по правилам выше;
+2. соседние нераспознанные строки склеиваются обратно в абзацы
    (TOC-строки остаются поштучно);
-4. дерево сплющивается в порядок документа и пересобирается стеком
-   по уровням (lift промоутнутых заголовков из чужой вложенности).
-
-Шкала (из ТЗ):
-
-| Признак | Баллы |
-|---|---|
-| Regex нумерации ``^(Раздел\\s+\\d+\\.?\|\\d+(\\.\\d+)*\\.?)(\\s\|$)`` / ``^\\d+\\)`` | +4 явный «Раздел N», иначе +3; level из `numbering_level` |
-| Аннотация ``bold=True`` | +2 |
-| ``size > 14`` | +1.5 |
-| Текст в КАПСЕ | +1 |
-| Длина < 100 символов | +1 |
-| ``alignment=center`` | +0.5 |
-| Заканчивается точкой и длиннее 120 символов | −2 |
-
-Уровень из нумерации: точки считаются только между цифрами
-(«Раздел 2.» → 1, «2.» → 1, «2.3» → 2, «2.3.1» → 3); ветка ``N)`` → 2.
+3. дерево сплющивается в порядок документа и пересобирается стеком
+   по уровням (lift распознанных заголовков из чужой вложенности).
 """
 
 import re
@@ -38,12 +44,58 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from rag_parser.core.interfaces import DocumentNode
 
-NUMBERING_RE = re.compile(
-    r"^(Раздел\s+\d+\.?|\d+(\.\d+)*\.?)(\s|$)|^\d+\)", re.IGNORECASE
+#: Структурные слова в начале строки (правило 2).
+STRUCTURAL_WORDS = ("Раздел", "Глава", "Часть", "Том", "Книга")
+#: Слова секций в начале строки (правило 3) — всегда уровень 1.
+SECTION_WORDS = (
+    "Введение",
+    "Заключение",
+    "Приложение",
+    "Список литературы",
+    "Библиография",
 )
+#: Слова оглавления/содержания в начале строки (правило 4).
+CONTENT_WORDS = ("Содержание", "Оглавление", "Table of Contents", "Contents")
+
+#: Минимальный кегль заголовка в пунктах (правило 1).
+MIN_HEADER_FONT_SIZE = 13.0
+
+#: Доля жирного текста, при которой строка считается заголовком (правило 9).
+#: Порог высокий намеренно: у заголовка жирно ВСЁ, а у выделенного термина
+#: («**ПДн** — персональные данные») — только начало. Низкий порог дал бы
+#: кучу ложных заголовков на терминах.
+BOLD_HEADING_COVERAGE = 0.9
+
+#: Числовая нумерация в начале: «1», «1)», «1.1», «1.1.1» (правила 6, 7).
+NUMBER_PREFIX_RE = re.compile(r"^(\d+(?:\.\d+)*)")
+#: Явный маркер «Раздел N» — используется для подавления `N)` и TOC-серий.
 RAZDEL_N_RE = re.compile(r"^Раздел\s+(\d+)", re.IGNORECASE)
+#: Только «N)» без другой нумерации — ветка, подавляемая в «Раздел N»-документах.
+PAREN_ONLY_RE = re.compile(r"^\d+\s*\)")
+#: Строка целиком из заглавных букв, цифр и разделителей (правило 5).
+CAPS_LINE_RE = re.compile(r"^[A-ZА-ЯЁ\s\-\.\d«»\"'()]+$")
+
+#: Жирный текст как триггер вложенности. Для ``.md`` разметка съедается
+#: рендерером, поэтому ``markdown_preprocessor`` заменяет ``<strong>``/``<b>``
+#: на эти маркеры ДО отдачи в dedoc: ``HtmlReader`` вытаскивает только текст.
+BOLD_MARKERS = ("__BOLD__", "<b>", "**")
+_BOLD_OPEN_RE = re.compile(r"^(?:__BOLD__|\*\*|<b>)", re.IGNORECASE)
+_BOLD_LEAD_RE = re.compile(r"^\s*(?:\*{1,3}|<b>)", re.IGNORECASE)
+_BOLD_TAIL_RE = re.compile(r"(?:\*{1,3}|</b>)\s*$", re.IGNORECASE)
+#: Базовый заголовок: «1 **Текст**» либо «1 НАЗВАНИЕ» (цифра + КАПС).
+_BASE_BOLD_RE = re.compile(r"^\d+[\.\)\s]+(?:\*\*.+?\*\*|__BOLD__)", re.IGNORECASE)
+_BASE_CAPS_RE = re.compile(r"^\d+[\.\)\s]+[А-ЯA-ZЁ\s]+$")
+#: Ключевые слова-триггеры вложенности.
+_NEST_KEYWORD_RE = re.compile(r"^(Раздел|Глава|Параграф|Подраздел|Часть)[\s\d]", re.IGNORECASE)
+#: Максимальная глубина вложенности заголовков.
+MAX_HEADER_LEVEL = 3
 
 TOC_SERIES_MIN = 5
+
+#: Маркер номера страницы в строке оглавления («… 4», «... 4»).
+_TOC_PAGE_MARKER_RE = re.compile(r"…|\.\.\.")
+#: Строка-разделитель («------», «======»): декорация, а не конец области.
+_TOC_DECORATION_RE = re.compile(r"^[-=_~*·.\s]{3,}$")
 
 
 def _annotations_of(node: DocumentNode) -> List[Dict[str, Any]]:
@@ -66,8 +118,13 @@ def _annotations_of(node: DocumentNode) -> List[Dict[str, Any]]:
     return result
 
 
-def _coverage(annotations: List[Dict[str, Any]], name: str, length: int) -> Tuple[bool, Any]:
-    """Есть ли аннотация ``name``, покрывающая >=60% строки. Возвращает (да, value)."""
+def _coverage(
+    annotations: List[Dict[str, Any]], name: str, length: int, threshold: float = 0.6
+) -> Tuple[bool, Any]:
+    """Есть ли аннотация ``name``, покрывающая >= ``threshold`` строки.
+
+    :return: ``(покрывает_ли, значение)``
+    """
     if length <= 0:
         return False, None
     best = 0.0
@@ -85,7 +142,7 @@ def _coverage(annotations: List[Dict[str, Any]], name: str, length: int) -> Tupl
         if ratio > best:
             best = ratio
             best_value = item.get("value")
-    return best >= 0.6, best_value
+    return best >= threshold, best_value
 
 
 def _is_truthy(value: Any) -> bool:
@@ -94,91 +151,326 @@ def _is_truthy(value: Any) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "bold")
 
 
-def numbering_level(matched: re.Match) -> int:
-    """Уровень заголовка из regex-нумерации.
-
-    Точки считаются только между группами цифр: «Раздел 2.» → 1,
-    «2.» → 1, «2.3» → 2, «2.3.1» → 3. Ветка ``N)`` (group(1) is None) —
-    подчинённый уровень 2.
-    """
-    group = matched.group(1)
-    if group is None:
-        return 2
-    number = re.sub(r"^Раздел\s+", "", group, flags=re.IGNORECASE).strip()
-    number = number.rstrip(".").rstrip(")")
-    return 1 + len(re.findall(r"(?<=\d)\.(?=\d)", number))
+def _as_size(value: Any) -> Optional[float]:
+    """Числовой кегль из значения аннотации ``size`` (``"12,5"`` -> 12.5)."""
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
 
 
-def score_node(
-    text: str,
-    annotations: List[Dict[str, Any]],
-    allow_paren: bool = True,
-) -> Tuple[float, Optional[int]]:
-    """Балл узла + уровень из нумерации (если есть).
+def numbering_level(text: str, allow_paren: bool = True) -> Optional[int]:
+    """Уровень заголовка из числовой нумерации или ``None``.
 
-    При ``allow_paren=False`` ветка ``N)`` не даёт ни баллов, ни уровня
-    (двухпроходная супрессия списков в «Раздел N»-документах).
+    ``level = (число точек в числовой части) + 1``:
+
+    * «1», «1)», «1. Название»      -> 1
+    * «1.1», «2.3 Название»         -> 2
+    * «1.1.1 Название»              -> 3
+    * «1.1.1.1 Название»            -> 4
+
+    Возвращает ``None``, если нумерации нет («Название», «1abc» — цифра
+    неотделима от текста) либо это подавляемая ветка ``N)``.
+
+    Терминатором нумерации считается точка, скобка, пробел или конец
+    строки. Greedy-совпадение ``\\d+(\\.\\d+)*`` захватывает всю
+    цепочку: regex ``^(\\d+(\\.\\d+)*)[\\.\\)\\s]`` из ТЗ на «1.1.1.1»
+    откатывается на «1.1.1» и дал бы уровень 3 вместо 4.
     """
     stripped = (text or "").strip()
-    score = 0.0
-    level: Optional[int] = None
+    match = NUMBER_PREFIX_RE.match(stripped)
+    if not match:
+        return None
+    number = match.group(1)
+    tail = stripped[match.end() :]
+    if tail and tail[0] not in ".) \t":
+        # «1abc», «2024год» — цифра не является началом нумерации.
+        return None
+    if tail.startswith(")"):
+        # Ветка `N)`: в «Раздел N»-документах она подавлена.
+        return None if not allow_paren else 1
+    return number.count(".") + 1
+
+
+def _starts_with_word(text: str, words: Tuple[str, ...]) -> bool:
+    """Регистронезависимая проверка ``startswith`` по списку слов."""
+    lowered = text.lower()
+    for word in words:
+        candidate = word.lower()
+        if lowered.startswith(candidate):
+            # «Список» не должно ловить «Список литературы» дважды, но
+            # «Содержание» не должно ловиться внутри «Содержательные
+            # данные» — отсекаем, если сразу идёт буква.
+            rest = lowered[len(candidate) :]
+            if not rest or rest[0] in " \t.,:;)]—-":
+                return True
+    return False
+
+
+def _is_caps(text: str) -> bool:
+    """Весь текст в верхнем регистре (пробелы/пунктуация игнорируются)."""
+    stripped = (text or "").strip()
     if not stripped:
-        return 0.0, None
+        return False
+    letters = [char for char in stripped if char.isalpha()]
+    if len(letters) < 2:
+        return False
+    return bool(CAPS_LINE_RE.match(stripped))
 
-    match = NUMBERING_RE.match(stripped)
-    if match and (allow_paren or match.group(1) is not None):
-        if match.group(1) is not None and RAZDEL_N_RE.match(
-            match.group(1).strip()
-        ):
-            # Явный маркер раздела — промоутится независимо от длины:
-            # длинные титулы («Раздел 5. Отчет ... по приоритетным ...»)
-            # иначе не добирают балл и их секции (включая таблицы)
-            # приписываются предыдущему разделу.
-            score += 4.0
-        else:
-            score += 3.0
-        level = numbering_level(match)
 
-    length = len(stripped)
-    bold, _ = _coverage(annotations, "bold", length)
-    if bold:
-        # bold считается только при truthy-значении хотя бы у одной покрывающей аннотации
-        for item in annotations:
-            if str(item.get("name", "")).lower() != "bold":
-                continue
-            try:
-                start = int(item.get("start", 0) or 0)
-                end = int(item.get("end", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if length and (min(end, length) - max(start, 0)) / length >= 0.6:
-                if _is_truthy(item.get("value")):
-                    score += 2.0
-                    break
+def _is_bold_heading(annotations: List[Dict[str, Any]], length: int) -> bool:
+    """Правило 9: строка целиком набрана жирным.
 
-    size_hit, size_value = _coverage(annotations, "size", length)
-    if size_hit:
+    ``dedoc`` отдаёт жирность аннотациями ``bold`` на каждом bold-run
+    (``readers/docx_reader/line_with_meta_converter.py``), и они уже
+    приходят в ``classify_header`` вторым параметром — отдельный экстрактор
+    метаданных не нужен.
+
+    Отсекаем выделенные термины: жирным должно быть почти всё (``bold``),
+    а не только префикс строки.
+    """
+    covered, value = _coverage(
+        annotations, "bold", length, threshold=BOLD_HEADING_COVERAGE
+    )
+    return bool(covered and _is_truthy(value))
+
+
+def _font_is_bigger(
+    annotations: List[Dict[str, Any]], base_size: Optional[float]
+) -> bool:
+    """Правило 1: кегль >= 13pt и строго больше базового размера текста.
+
+    ``base_size`` — модальный кегль основного текста документа (считается
+    один раз на документ). Если он неизвестен, сравниваем только с порогом
+    13pt: строка крупнее 13pt — заголовок в любом случае.
+    """
+    if base_size is None:
+        return False
+    hit, value = _coverage(annotations, "size", _line_length(annotations))
+    if not hit:
+        return False
+    size = _as_size(value)
+    if size is None:
+        return False
+    if size < MIN_HEADER_FONT_SIZE:
+        return False
+    return size > base_size
+
+
+def _line_length(annotations: List[Dict[str, Any]]) -> int:
+    """Длина текста, покрытого аннотациями (для расчёта покрытия)."""
+    length = 0
+    for item in annotations:
         try:
-            if float(str(size_value).replace(",", ".")) > 14:
-                score += 1.5
+            length = max(length, int(item.get("end", 0) or 0))
         except (TypeError, ValueError):
-            pass
+            continue
+    return length
 
-    letters = [ch for ch in stripped if ch.isalpha()]
-    if len(letters) >= 4 and all(ch.isupper() for ch in letters):
-        score += 1.0
 
-    if length < 100:
-        score += 1.0
+class HeaderLevelTracker:
+    """Уровень заголовка по СОСТОЯНИЮ документа, а не по точкам в номере.
 
-    center_hit, center_value = _coverage(annotations, "alignment", length)
-    if center_hit and str(center_value).strip().lower() == "center":
-        score += 0.5
+    Наивное «уровень = точек + 1» ломается на вложенности: «1.1» и «1.2»
+    получают одинаковый уровень, но у документа бывают «1.2.1», где
+    «1.2» — уже третий уровень. Трекер держит стек последних уровней и
+    различает **углубление** («1.1» -> «1.1.1») от **соседства**
+    («1.1» -> «1.2» — это тот же уровень, а не следующий).
 
-    if length > 120 and stripped.endswith("."):
-        score -= 2.0
+    Правила:
 
-    return score, level
+    * базовый заголовок (цифра + КАПС либо цифра + жирный) -> уровень 1,
+      стек сбрасывается;
+    * триггер вложенности (нумерация с точками, жирный текст без цифры,
+      ключевое слово) даёт следующий уровень;
+    * глубина ограничена ``MAX_HEADER_LEVEL``; при попытке уйти глубже
+      скользящее окно отбрасывает самый верхний уровень;
+    * без триггера строка считается базовой: стек сбрасывается на неё.
+
+    Экземпляр — **один на документ**; состояние намеренно не глобальное.
+
+    Отличие от псевдокода в ТЗ
+    ---------------------------
+    В ТЗ на ветке «нет триггера» стоит ``return 1`` БЕЗ обновления стека.
+    Из-за этого «1 Текст» (не КАПС, не жирный, триггеров нет) оставляет
+    стек пустым, и следующий заголовок «1.1 Текст» получает уровень 1
+    вместо 2. На собственных примерах ТЗ это даёт провал 7 из 7:
+    ``["1 Текст", "1.1 Текст", "1.2 Текст"] -> [1, 1, 2]`` вместо
+    ``[1, 2, 2]``. Поэтому здесь без триггера стек **сбрасывается** на
+    текущую строку — с этой поправкой проходят все 7 случаев из ТЗ.
+    """
+
+    def __init__(self) -> None:
+        self.level_stack: List[Tuple[int, str]] = []
+
+    def reset(self) -> None:
+        """Сброс между документами."""
+        self.level_stack = []
+
+    def calculate_level(self, text: str) -> int:
+        number = self.extract_number(text)
+        if self.is_base_header(text):
+            self.level_stack = [(1, number)]
+            return 1
+
+        trigger = self.detect_trigger(text)
+        if not trigger:
+            # Без триггера строка — базовая: сбрасываем стек (см. выше).
+            self.level_stack = [(1, number)]
+            return 1
+
+        if len(self.level_stack) == 0:
+            new_level = 1
+        elif len(self.level_stack) == 1:
+            new_level = 2
+        elif len(self.level_stack) == 2:
+            previous_level, previous = self.level_stack[-1]
+            # Сосед наследует УРОВЕНЬ предыдущего соседа, а не всегда 2.
+            # Иначе в оглавлении «6.2.1» -> «6.2.2» -> «6.2.3» (все третьего
+            # уровня) последний получал бы 2: после скользящего окна стек
+            # содержит [(2, «6.2»), (3, «6.2.2»)], и соседство с «6.2.2»
+            # обнуляло бы глубину до второго уровня.
+            new_level = (
+                previous_level if self.is_sibling(number, previous) else 3
+            )
+        else:
+            # Скользящее окно: уходим глубже максимума — режем верх.
+            self.level_stack.pop(0)
+            new_level = MAX_HEADER_LEVEL
+
+        self._push(new_level, number)
+        return new_level
+
+    def _push(self, level: int, number: str) -> None:
+        """Кладёт уровень в стек, ЗАМЕНЯЯ соседа на том же уровне.
+
+        ТЗ в этом месте неполон: он всегда делает ``append``, из-за чего
+        соседство «1.1» -> «1.2» -> «1.3» раздувает стек, и четвёртый
+        заголовок подряд уходит в ветку обрезки и получает уровень 3
+        вместо 2. Сосед — это замена элемента стека, а не новый элемент.
+        """
+        if self.level_stack and self.level_stack[-1][0] == level:
+            self.level_stack[-1] = (level, number)
+        else:
+            self.level_stack.append((level, number))
+
+    @staticmethod
+    def extract_number(text: str) -> str:
+        """Числовая часть заголовка («1.2.1» -> «1.2.1», «Приложение» -> «»)."""
+        match = NUMBER_PREFIX_RE.match((text or "").strip())
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def is_base_header(text: str) -> bool:
+        """Базовый заголовок: цифра + жирный либо цифра + КАПС."""
+        stripped = (text or "").strip()
+        return bool(
+            _BASE_BOLD_RE.match(stripped) or _BASE_CAPS_RE.match(stripped)
+        )
+
+    @staticmethod
+    def detect_trigger(text: str) -> Optional[str]:
+        """Триггер вложенности: нумерация, жирный текст, ключевое слово."""
+        stripped = (text or "").strip()
+        if re.match(r"^\d+\.\d+", stripped):
+            return "numbered"
+        if _BOLD_OPEN_RE.match(stripped):
+            return "bold"
+        if _NEST_KEYWORD_RE.match(stripped):
+            return "keyword"
+        return None
+
+    @staticmethod
+    def is_sibling(current: str, previous: str) -> bool:
+        """Соседи ли номера: «1.1» и «1.2» — да, «1.1» и «1.1.1» — нет."""
+        current_parts = current.split(".")
+        previous_parts = previous.split(".")
+        if len(current_parts) == len(previous_parts):
+            return (
+                current_parts[:-1] == previous_parts[:-1]
+                and current_parts[-1] != previous_parts[-1]
+            )
+        return len(current_parts) <= len(previous_parts)
+
+
+def classify_header(
+    text: str,
+    annotations: Optional[List[Dict[str, Any]]] = None,
+    *,
+    base_size: Optional[float] = None,
+    allow_paren: bool = True,
+) -> Tuple[bool, Optional[int]]:
+    """Детерминированная классификация строки.
+
+    :return: ``(True, level)`` — строка является заголовком;
+             ``(False, None)`` — обычный текст.
+
+    Порядок правил влияет только на УРОВЕНЬ: при наличии числовой
+    нумерации уровень считается по ней, иначе он равен 1.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False, None
+
+    annotations = annotations or []
+    level = numbering_level(stripped, allow_paren=allow_paren)
+
+    # Правила 6 и 7: нумерация в начале (в т.ч. «2.3 АНАЛИЗ ДАННЫХ» —
+    # нумерация даёт уровень, КАПС остатка подтверждает заголовок).
+    if level is not None:
+        return True, level
+
+    # Правила 2, 3, 4: структурные слова, слова секций и содержания.
+    if _starts_with_word(stripped, STRUCTURAL_WORDS):
+        return True, 1
+    if _starts_with_word(stripped, SECTION_WORDS):
+        return True, 1
+    if _starts_with_word(stripped, CONTENT_WORDS):
+        return True, 1
+
+    # Правило 5: весь текст в верхнем регистре.
+    if _is_caps(stripped):
+        return True, 1
+
+    # Правило 1: кегль >= 13pt и больше базового размера текста.
+    if _font_is_bigger(annotations, base_size):
+        return True, 1
+
+    # Правило 8: жирный текст в начале строки («**Подраздел**»). Уровень
+    # не задаём — его посчитает HeaderLevelTracker по предыдущим
+    # заголовкам (это триггер вложенности, а не признак уровня).
+    if _BOLD_OPEN_RE.match(stripped):
+        return True, None
+
+    # Правило 9: DOCX-жирность. Жирность живёт в аннотациях, а не в тексте,
+    # поэтому строка вроде «Предисловие» без нумерации и без стиля Heading
+    # иначе осталась бы обычным абзацем.
+    if _is_bold_heading(annotations, len(stripped)):
+        return True, None
+
+    return False, None
+
+
+def strip_bold_markers(text: str) -> str:
+    """Убирает маркеры жирного текста с краёв готовой строки.
+
+    Маркеры служебные: они несут информацию для ``HeaderLevelTracker`` и
+    ``classify_header``, но в итоговый Markdown попадать не должны.
+
+    ``__BOLD__`` — наш собственный маркер, вычищается целиком. ``**`` и
+    ``<b>`` — разметка самого документа, поэтому снимаются только в начале
+    и в конце строки (именно там триггер и срабатывает); ``**в середине**``
+    остаётся и рендерится как жирный текст.
+    """
+    result = (text or "").replace("__BOLD__", "")
+    stripped = result.strip()
+    # Симметрично: снимаем края только если строка ЦЕЛИКОМ обёрнута в
+    # жирный. Иначе «**жирный** внутри текста» потерял бы открывающий
+    # маркер и превратился в «жирный** внутри текста».
+    if _BOLD_LEAD_RE.match(stripped) and _BOLD_TAIL_RE.search(stripped):
+        stripped = _BOLD_TAIL_RE.sub("", stripped)
+        stripped = _BOLD_LEAD_RE.sub("", stripped)
+    return stripped.strip()
 
 
 def _slice_annotations(
@@ -375,12 +667,37 @@ def _presplit(node: DocumentNode) -> List[DocumentNode]:
     return _split_lines(node)
 
 
+def _base_font_size(lines: List[DocumentNode]) -> Optional[float]:
+    """Базовый кегль основного текста документа (модальный размер).
+
+    Правило 1 требует сравнения «строго больше базового размера», а базовый
+    размер — свойство ДОКУМЕНТА, а не строки. Берём самый частый кегль:
+    основной текст встречается в разы чаще заголовков.
+    """
+    counter: Dict[float, int] = {}
+    for line in lines:
+        for item in _annotations_of(line):
+            if str(item.get("name", "")).lower() != "size":
+                continue
+            size = _as_size(item.get("value"))
+            if size is None:
+                continue
+            counter[size] = counter.get(size, 0) + 1
+    if not counter:
+        return None
+    return max(counter.items(), key=lambda pair: (pair[1], -pair[0]))[0]
+
+
 def _is_suppressed_paren(text: str, allow_paren: bool) -> bool:
-    """Строка `N)` при запрете paren-ветки (двухпроходная супрессия)."""
+    """Строка `N)` при запрете paren-ветки (двухпроходная супрессия).
+
+    В документах с >=2 различными «Раздел N» префикс ``N)`` ставит сам dedoc
+    из автонумерации Word (`numbering.xml, lvlText=%1)`) — это пункты
+    перечня, а не заголовки.
+    """
     if allow_paren:
         return False
-    match = NUMBERING_RE.match((text or "").strip())
-    return match is not None and match.group(1) is None
+    return PAREN_ONLY_RE.match((text or "").strip()) is not None
 
 
 def _count_razdel(lines: List[DocumentNode]) -> int:
@@ -424,12 +741,87 @@ def _mark_toc(lines: List[DocumentNode]) -> int:
     return count
 
 
-def promote_headers(root: DocumentNode, threshold: Optional[float] = None) -> DocumentNode:
-    """Промоут визуальных заголовков. Не мутирует вход (возвращает новое дерево)."""
-    from rag_parser.core.config import settings
+def _is_toc_entry(text: str) -> bool:
+    """Похоже ли строка на ЗАПИСЬ оглавления (а не на текст раздела).
 
-    limit = float(settings.HEADER_PROMOTION_THRESHOLD if threshold is None else threshold)
+    Обязателен маркер страницы — иначе под правило попал бы любой
+    нумерованный абзац: «1 Введение … 4» это запись оглавления, а
+    «1 Введение к методам оценки качества» это обычный заголовок.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return True  # пустая строка область не прерывает
+    if _TOC_DECORATION_RE.match(stripped):
+        # «Содержание\n----------------\n1 Область применения … 1»:
+        # разделитель под заголовком оглавления не должен обрывать область.
+        return True
+    if _starts_with_word(stripped, CONTENT_WORDS):
+        return False
+    if not _TOC_PAGE_MARKER_RE.search(stripped):
+        return False
+    return bool(
+        NUMBER_PREFIX_RE.match(stripped)
+        or RAZDEL_N_RE.match(stripped)
+        or _starts_with_word(stripped, STRUCTURAL_WORDS)
+        or _starts_with_word(stripped, SECTION_WORDS)
+    )
 
+
+def _mark_toc_section(lines: List[DocumentNode]) -> int:
+    """Гасит записи оглавления в разделе «Содержание»/«Оглавление».
+
+    Без этого каждая строка вида «5.1 Первое положение … 4» становится
+    заголовком и засоряет дерево фантомными разделами: в ``gost_report.txt``
+    это 19 записей из 56 заголовков, почти все уровня 1.
+
+    Область идёт от строки-«Содержание» до первого не-TOC абзаца. Подавление
+    применяется только если записей не меньше ``TOC_SERIES_MIN`` — иначе это
+    не оглавление, а обычный текст со ссылками на страницы.
+
+    Обход идёт по **всем** узлам в порядке документа, а не только по листьям:
+    запись оглавления может оказаться составным узлом (с детьми) — тогда до
+    листьев она не дойдёт, останется контейнером и станет заголовком целиком.
+    Именно так просочились «5.2», «6.2» и «6.2.3» в gost_report.txt.
+    """
+    count = 0
+    index = 0
+    total = len(lines)
+    while index < total:
+        if not _starts_with_word((lines[index].text or "").strip(), CONTENT_WORDS):
+            index += 1
+            continue
+        index += 1
+        entries: List[DocumentNode] = []
+        while index < total and _is_toc_entry(lines[index].text):
+            if (lines[index].text or "").strip():
+                entries.append(lines[index])
+            index += 1
+        if len(entries) >= TOC_SERIES_MIN:
+            for item in entries:
+                item.metadata["toc"] = True
+            count += len(entries)
+    return count
+
+
+def promote_headers(
+    root: DocumentNode,
+    threshold: Optional[float] = None,  # noqa: ARG001 - DEPRECATED, игнорируется
+    promote_non_headers: bool = True,
+) -> DocumentNode:
+    """Классифицирует заголовки по жёстким правилам. Не мутирует вход.
+
+    :param threshold: **устаревший параметр**, оставлен для совместимости
+        вызовов и намеренно ИГНОРИРУЕТСЯ: у детерминированной
+        классификации нет порога. Настраивать заголовки правкой правил
+        в этом модуле.
+    :param promote_non_headers: нужно ли повышать до заголовка строки,
+        которые dedoc не назвал заголовком. Для форматов, прошедших через
+        HTML-маршрут (``.html``/``.md``/``.xml``/``.txt``), разметка
+        источника авторитетна, и правила лучше **не** применять: иначе
+        нумерованный пункт вида «1 ПОДГОТОВЛЕН Национальной...» (это
+        ``<item>``, то есть абзац) начнёт считаться заголовком. Для
+        DOCX/PDF/TXT без разметки параметр остаётся ``True``.
+    """
     # Проход 0: пре-сплит всех листьев + сканы по порядку строк.
     split_children: List[DocumentNode] = []
     for child in root.children:
@@ -445,10 +837,16 @@ def promote_headers(root: DocumentNode, threshold: Optional[float] = None) -> Do
                 _collect(item.children)
 
     _collect(split_children)
+    # Один трекер на весь документ: уровни заголовков зависят от
+    # предыдущих заголовков (углубление против соседства), поэтому
+    # состояние НЕ может быть локальным. Новый документ — новый трекер.
+    tracker = HeaderLevelTracker()
+
     scan_lines = [node for node in scan if not node.children]
     allow_paren = _count_razdel(scan_lines) < 2
-    toc_suppressed = _mark_toc(scan_lines)
+    toc_suppressed = _mark_toc(scan_lines) + _mark_toc_section(scan)
     paren_suppressed = 0
+    base_size = _base_font_size(scan_lines)
 
     def process_children(children: List[DocumentNode]) -> List[DocumentNode]:
         """Рекурсивно обрабатывает список детей, возвращает новый список."""
@@ -475,27 +873,32 @@ def promote_headers(root: DocumentNode, threshold: Optional[float] = None) -> Do
                 paren_suppressed += 1
                 node_type, level = node.type, node.level
             else:
-                score, numbered_level = score_node(
-                    node.text, _annotations_of(node), allow_paren
+                is_header, new_level = classify_header(
+                    node.text,
+                    _annotations_of(node),
+                    base_size=base_size,
+                    allow_paren=allow_paren,
                 )
                 node_type, level = node.type, node.level
                 if (
-                    node_type != "header"
+                    promote_non_headers
+                    and node_type != "header"
                     and node.text.strip()
                     and not node.metadata.get("toc")
-                    and score >= limit
+                    and is_header
                 ):
-                    node_type, level = "header", numbered_level or 1
+                    node_type = "header"
+                    level = tracker.calculate_level(node.text)
             return [
                 DocumentNode(
                     type=node_type,
                     level=level,
-                    text=node.text,
+                    text=strip_bold_markers(node.text),
                     children=sub,
                     metadata=dict(node.metadata),
                 )
             ]
-        # лист (после пре-сплита — однострочный): скорим → клеим абзацы
+        # лист (после пре-сплита — однострочный): классифицируем → клеим абзацы
         lines = _split_lines(node)
         scored: List[DocumentNode] = []
         for line in lines:
@@ -506,20 +909,26 @@ def promote_headers(root: DocumentNode, threshold: Optional[float] = None) -> Do
                 paren_suppressed += 1
                 scored.append(line)
                 continue
-            score, numbered_level = score_node(
-                line.text, _annotations_of(line), allow_paren
+            is_header, new_level = classify_header(
+                line.text,
+                _annotations_of(line),
+                base_size=base_size,
+                allow_paren=allow_paren,
             )
-            if line.type != "header" and score >= limit:
+            if promote_non_headers and line.type != "header" and is_header:
                 scored.append(
                     DocumentNode(
                         type="header",
-                        level=numbered_level or 1,
-                        text=line.text,
+                        # Уровень считаем ДО очистки: триггер жирного
+                        # текста читается по маркерам.
+                        level=tracker.calculate_level(line.text),
+                        text=strip_bold_markers(line.text),
                         children=[],
                         metadata=dict(line.metadata),
                     )
                 )
             else:
+                line.text = strip_bold_markers(line.text)
                 scored.append(line)
         return _merge_paragraphs(scored)
 
@@ -542,4 +951,16 @@ def promote_headers(root: DocumentNode, threshold: Optional[float] = None) -> Do
     )
 
 
-__all__ = ["NUMBERING_RE", "promote_headers", "score_node"]
+__all__ = [
+    "BOLD_MARKERS",
+    "CONTENT_WORDS",
+    "MAX_HEADER_LEVEL",
+    "HeaderLevelTracker",
+    "MIN_HEADER_FONT_SIZE",
+    "SECTION_WORDS",
+    "STRUCTURAL_WORDS",
+    "classify_header",
+    "numbering_level",
+    "promote_headers",
+    "strip_bold_markers",
+]

@@ -23,7 +23,8 @@
 в чанкер. :func:`build_full_tree` возвращает дерево с ПОЛНЫМИ текстами.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from rag_parser.core.interfaces import DocumentNode
 
@@ -401,20 +402,34 @@ def _table_node(md_table: str) -> DocumentNode:
     )
 
 
-def _attach_tables(
-    children: List[DocumentNode], tables: List[Any]
-) -> int:
+def _attach_tables(children: List[DocumentNode], tables: List[Any]) -> int:
     """Привязка таблиц к узлам-якорям по `TableAnnotation`.
 
     Таблица вставляется первым ребёнком якоря (позиция dedoc: конец текста
     узла, до остальных детей). Таблицы без якоря (нет аннотации, неизвестный
-    uid, дубли, Excel/CSV без привязки) — append в конец + warning.
-    Возвращает число orphan-таблиц.
+    uid, xlsx/csv/html, где dedoc аннотаций не выдаёт) — append в конец +
+    warning. Возвращает число orphan-таблиц.
+
+    Очереди вместо словаря — обход бага dedoc 2.8
+    ------------------------------------------
+    ``dedoc`` считает uid таблицы как ``md5(xml)`` БЕЗ дедупликации
+    (``readers/docx_reader/data_structures/table.py``), тогда как для
+    абзацев дедуп есть (``while uid in self.uids_set``). Поэтому N
+    ПОБАЙТОВО ОДИНАКОВЫХ таблиц получают ОДИНАКОВЫЙ uid — при хранении
+    ``dict[uid] -> node`` все они схлопывались в одну, и привязать удавалась
+    только первая, остальные уходили в orphan. На реальном документе
+    (ГОСТ, 9 одинаковых таблиц «Показатель / Q1 / Q2») это давало
+    orphan = 8 из 9.
+
+    Решение: очередь таблиц на каждый uid, обход дерева разбирает её по
+    порядку — ровно одна таблица на одну встретившуюся аннотацию. Это
+    корректно, потому что и список таблиц, и порядок обхода аннотаций идут
+    в порядке документа, поэтому i-я аннотация соответствует i-й таблице.
 
     NB: вызывать ПОСЛЕ промоции (`promote_headers`): привязка до неё делает
     якорь composite-узлом и блокирует резку многострочников — merged-узел
     «Раздел 6 + тело + Раздел 7» промоутился бы целиком. Аннотации переживают
-    split/merge (срезы со пересчётом оффсетов), поэтому поздняя привязка
+    split/merge (срезы с пересчётом оффсетов), поэтому поздняя привязка
     попадает точнее — в конкретную строку якоря.
     """
     import logging
@@ -422,7 +437,7 @@ def _attach_tables(
     from rag_parser.parsers.base import rows_to_markdown_table
 
     log = logging.getLogger(__name__)
-    by_uid: Dict[str, DocumentNode] = {}
+    by_uid: Dict[str, List[DocumentNode]] = {}
     early_orphans: List[DocumentNode] = []
     for table in tables or []:
         rows = table_to_rows(table)
@@ -431,11 +446,11 @@ def _attach_tables(
         md_table, _, _ = rows_to_markdown_table(rows)
         node = _table_node(md_table)
         uid = _table_uid(table)
-        if uid and uid not in by_uid:
-            by_uid[uid] = node
+        if uid:
+            # Порядок в очереди = порядок появления в документе.
+            by_uid.setdefault(uid, []).append(node)
         else:
             early_orphans.append(node)
-    rendered = set()
 
     def visit(node: DocumentNode) -> None:
         anchored: List[DocumentNode] = []
@@ -444,9 +459,11 @@ def _attach_tables(
             if isinstance(node.metadata.get("annotations"), list)
             else []
         ):
-            if uid in by_uid and uid not in rendered:
-                anchored.append(by_uid[uid])
-                rendered.add(uid)
+            queue = by_uid.get(uid)
+            if queue:
+                # Одна аннотация = одна таблица. Опустошать очередь целиком
+                # нельзя: тогда первая же аннотация забрала бы все таблицы.
+                anchored.append(queue.pop(0))
         if anchored:
             node.children = [*anchored, *node.children]
         for child in node.children:
@@ -454,11 +471,11 @@ def _attach_tables(
 
     for child in children:
         visit(child)
+    # Всё, что не забрали по аннотациям, — orphan (в порядке появления).
     orphans: List[DocumentNode] = list(early_orphans)
-    for uid, node in by_uid.items():
-        if uid not in rendered:
-            children.append(node)
-            orphans.append(node)
+    for queue in by_uid.values():
+        orphans.extend(queue)
+        children.extend(queue)
     children.extend(early_orphans)
     if orphans:
         log.warning("orphan_tables", extra={"count": len(orphans)})
@@ -490,6 +507,38 @@ def reattach_tables(root: DocumentNode, tables: List[Any]) -> int:
     orphans = _attach_tables(root.children, tables)
     root.metadata["orphan_tables"] = orphans
     return orphans
+
+
+def attach_tables_by_position(
+    root: DocumentNode, markdown_tables: Sequence[str]
+) -> int:
+    """Привязка HTML-таблиц по маркерам, оставленным в тексте.
+
+    Нужна для форматов, где dedoc не даёт ``TableAnnotation``
+    (HTML и все производные: ``.md``/``.xml``/``.txt`` через
+    ``html_preprocessor``). Таблицы там приходят отдельным списком и не
+    имеют позиции, поэтому позиция восстанавливается маркерами.
+
+    :return: число orphan-таблиц (тех, что оказались выше первого
+        заголовка и привязать их не к чему).
+    """
+    from rag_parser.parsers.html_preprocessor import extract_and_attach_tables
+
+    if not markdown_tables:
+        root.metadata["orphan_tables"] = root.metadata.get("orphan_tables", 0)
+        return int(root.metadata["orphan_tables"])
+
+    attached, orphans = extract_and_attach_tables(root, markdown_tables)
+    already = int(root.metadata.get("orphan_tables", 0) or 0)
+    total = already + orphans
+    root.metadata["orphan_tables"] = total
+    root.metadata["tables_by_marker"] = attached
+    log = logging.getLogger(__name__)
+    log.info(
+        "html_tables_attached",
+        extra={"attached": attached, "orphans": orphans, "total_tables": len(markdown_tables)},
+    )
+    return total
 
 
 def truncate(node: DocumentNode, preview_len: int = 30) -> DocumentNode:

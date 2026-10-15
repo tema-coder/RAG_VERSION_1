@@ -1,370 +1,673 @@
-"""Тесты HeaderPromoter: скоринг + обе фикстуры (со стилями / без)."""
+"""Тесты детерминированного распознавания заголовков.
+
+Скоринг и порог удалены: заголовком делает строгое совпадение с одним из
+7 правил (см. docstring ``parsers/header_promoter.py``).
+"""
 
 import pytest
 
 from rag_parser.core.interfaces import DocumentNode
-from rag_parser.parsers.dedoc_tree import build_full_tree
-from rag_parser.parsers.header_promoter import promote_headers, score_node
+from rag_parser.parsers.header_promoter import (
+    MAX_HEADER_LEVEL,
+    MIN_HEADER_FONT_SIZE,
+    HeaderLevelTracker,
+    classify_header,
+    numbering_level,
+    promote_headers,
+    strip_bold_markers,
+)
 
 
-def _node(text, annotations=None, node_type="paragraph"):
-    return DocumentNode(
-        type=node_type,
-        level=0,
-        text=text,
-        children=[],
-        metadata={"annotations_count": len(annotations or []),
-                  "annotations": annotations or []},
+def _ann(name, value, length=40):
+    return [{"name": name, "start": 0, "end": length, "value": value}]
+
+
+class TestRule1FontSize:
+    """Кегль >= 13pt И строго больше базового размера текста документа."""
+
+    def test_size_above_base_is_header(self):
+        is_header, level = classify_header(
+            "Крупный заголовок", _ann("size", 16.0), base_size=11.0
+        )
+        assert is_header and level == 1
+
+    def test_size_equal_to_base_is_not_header(self):
+        """Строго больше: равный базовому кегль — обычный текст."""
+        is_header, _ = classify_header(
+            "Обычный текст документа", _ann("size", 11.0), base_size=11.0
+        )
+        assert is_header is False
+
+    def test_size_below_threshold_ignored(self):
+        """13pt — нижняя граница; 12pt даже при маленькой базе не заголовок."""
+        is_header, _ = classify_header(
+            "Текст", _ann("size", 12.0), base_size=9.0
+        )
+        assert is_header is False
+
+    def test_threshold_constant_is_13(self):
+        assert MIN_HEADER_FONT_SIZE == 13.0
+
+    def test_without_base_size_font_rule_inactive(self):
+        """Без базового размера правило не срабатывает (нет с чем сравнить)."""
+        is_header, _ = classify_header("Текст", _ann("size", 20.0), base_size=None)
+        assert is_header is False
+
+    def test_comma_decimal_parsed(self):
+        is_header, _ = classify_header(
+            "Текст", _ann("size", "13,5"), base_size=10.0
+        )
+        assert is_header is True
+
+
+class TestRule2StructuralWords:
+    """Раздел / Глава / Часть / Том / Книга в начале строки."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Раздел 2. Показатели",
+            "раздел 2. Показатели",
+            "Глава 3 Основы",
+            "Часть II Обзор",
+            "Том 1",
+            "Книга первая",
+        ],
     )
-
-
-def _ann(name, start, end, value):
-    return {"name": name, "start": start, "end": end, "value": value}
-
-
-class TestScoring:
-    def test_numbering_doc(self):
-        score, level = score_node("Раздел 2. Показатели", [])
-        assert score == 5.0  # +4 явный маркер раздела, +1 длина
+    def test_structural_words_are_headers(self, text):
+        is_header, level = classify_header(text)
+        assert is_header is True
         assert level == 1
 
-    def test_long_razdel_promotes_despite_length(self):
-        long_title = (
-            "Раздел 5. Отчет совета директоров о результатах развития "
-            "общества по приоритетным направлениям деятельности"
-        )
-        assert len(long_title) > 100
-        score, level = score_node(long_title, [])
-        assert score >= 4.0 and level == 1
+    def test_word_inside_line_is_not_enough(self):
+        """«В Разделе 2 говорится...» — слово не в начале."""
+        is_header, _ = classify_header("В Разделе 2 говорится о таблице")
+        assert is_header is False
 
-    def test_numbering_paren_level(self):
-        score, level = score_node("2) Функции потерь и метрики", [])
-        assert score >= 3.0
-        assert level == 2  # подчинённый уровень
-        nospace, nospace_level = score_node("3)Подготовка датасета", [])
-        assert nospace >= 3.0
-        assert nospace_level == 2
+    def test_partial_word_not_matched(self):
+        """«Раздельность» не должно ловиться как «Раздел»."""
+        assert classify_header("Раздельность трудов")[0] is False
 
-    def test_numbering_trailing_dot_ignored(self):
-        assert score_node("Раздел 2.", [])[1] == 1
-        assert score_node("2.", [])[1] == 1
-        assert score_node("2. x", [])[1] == 1
-        assert score_node("2.3 Метрики", [])[1] == 2
-        assert score_node("1.2.3 Детали", [])[1] == 3
 
-    def test_paren_suppressed_with_razdel(self):
-        score, level = score_node("3) пункт списка", [], allow_paren=False)
-        assert score < 4.0 and level is None
-        score2, level2 = score_node("Раздел 2. Показатели", [], allow_paren=False)
-        assert score2 >= 4.0 and level2 == 1
+class TestRule3SectionWords:
+    """Введение / Заключение / Приложение / Список литературы / Библиография."""
 
-    def test_numbering_dotted_level(self):
-        score, level = score_node("2.3 Основные показатели", [])
-        assert score >= 3.0
+    @pytest.mark.parametrize(
+        "text",
+        ["Введение", "Заключение", "Приложение А", "Список литературы",
+         "Библиография"],
+    )
+    def test_section_words_are_headers_level_one(self, text):
+        is_header, level = classify_header(text)
+        assert is_header is True
+        assert level == 1
+
+    def test_case_insensitive(self):
+        assert classify_header("введение в работу")[0] is True
+
+
+class TestRule4ContentWords:
+    """Содержание / Оглавление / Table of Contents / Contents."""
+
+    @pytest.mark.parametrize(
+        "text", ["Содержание", "Оглавление", "Table of Contents", "Contents"]
+    )
+    def test_content_words_are_headers(self, text):
+        is_header, level = classify_header(text)
+        assert is_header is True and level == 1
+
+
+class TestRule5Caps:
+    """Текст целиком в верхнем регистре."""
+
+    def test_caps_is_header(self):
+        is_header, level = classify_header("МЕТОДОЛОГИЯ ИССЛЕДОВАНИЯ")
+        assert is_header is True and level == 1
+
+    def test_caps_with_digits_and_dots(self):
+        assert classify_header("ГОСТ Р 99999-2026")[0] is True
+
+    def test_title_case_is_not_header(self):
+        assert classify_header("Методология исследования")[0] is False
+
+    def test_single_letter_rejected(self):
+        """Одна буква — слишком коротко, чтобы считать признаком."""
+        assert classify_header("A")[0] is False
+
+    def test_mixed_caps_not_header(self):
+        assert classify_header("МЕТОДОЛОГИЯ исследования")[0] is False
+
+
+class TestRule6CapsWithNumbering:
+    """Нумерация + КАПС остатка: «2.3 АНАЛИЗ ДАННЫХ»."""
+
+    def test_numbered_caps(self):
+        is_header, level = classify_header("2.3 АНАЛИЗ ДАННЫХ")
+        assert is_header is True
         assert level == 2
-        _, level3 = score_node("1.2.3 Детали", [])
-        assert level3 == 3
 
-    def test_bold(self):
-        text = "Короткий заголовок"
-        base, _ = score_node(text, [])
-        score, _ = score_node(
-            text, [_ann("bold", 0, len(text), True)]
-        )
-        assert score == base + 2.0
-
-    def test_bold_false_no_points(self):
-        text = "Короткий заголовок"
-        base, _ = score_node(text, [])
-        score, _ = score_node(text, [_ann("bold", 0, len(text), "False")])
-        assert score == base
-
-    def test_size(self):
-        text = "Заголовок"
-        base, _ = score_node(text, [])
-        score, _ = score_node(text, [_ann("size", 0, len(text), "16.0")])
-        assert score == base + 1.5
-        small, _ = score_node(text, [_ann("size", 0, len(text), "11.0")])
-        assert small == base
-
-    def test_caps(self):
-        score, _ = score_node("ВАЖНОЕ ОБЪЯВЛЕНИЕ", [])
-        base, _ = score_node("Важное объявление", [])
-        assert score == base + 1.0
-
-    def test_short(self):
-        score, _ = score_node("Коротко", [])
-        long_score, _ = score_node("x" * 100, [])
-        assert score == long_score + 1.0
-
-    def test_center(self):
-        text = "Заголовок"
-        base, _ = score_node(text, [])
-        score, _ = score_node(text, [_ann("alignment", 0, len(text), "center")])
-        assert score == base + 0.5
-
-    def test_sentence_penalty(self):
-        body = "Длинное предложение тела документа, которое заканчивается точкой. " * 3
-        assert body.strip().endswith(".") and len(body) > 120
-        score, _ = score_node(body, [])
-        short = body[:50]
-        short_score, _ = score_node(short, [])
-        assert score < short_score
-        assert score == short_score - 1.0 - 2.0 or score <= short_score - 2.0
-
-    def test_empty(self):
-        assert score_node("", []) == (0.0, None)
+    def test_numbered_caps_deep(self):
+        is_header, level = classify_header("6.2.3 ОБЛАСТИ ИСПОЛЬЗОВАНИЯ")
+        assert is_header is True and level == 3
 
 
-class TestPromote:
-    def _root(self, children):
-        return DocumentNode(type="document", level=0, text="",
-                            children=children, metadata={})
+class TestRule7Numbering:
+    """Числовая нумерация в начале.
 
-    def test_threshold_override(self):
-        children = [_node("Раздел 5. Итоги")]  # 3 + 1 = 4.0
-        low = promote_headers(self._root(children), threshold=0.0)
-        assert low.children[0].type == "header"
-        high = promote_headers(self._root(children), threshold=8.0)
-        assert high.children[0].type != "header"
+    ``numbering_level`` — ЧИСТАЯ функция: она разбирает номер и ничего не
+    знает про остальной документ, поэтому «1.1.1.1» даёт 4. Итоговый
+    уровень заголовка считает ``HeaderLevelTracker`` по состоянию
+    документа и ограничен тремя — см. ``TestDepthCap``.
+    """
 
-    def test_default_threshold_from_config(self):
-        children = [_node("Обычный абзац без признаков заголовка " * 5)]
-        root = promote_headers(self._root(children))
-        assert all(c.type != "header" for c in root.children)
-
-    def test_multiline_split(self):
-        body = "Текст тела. " * 30
-        node = _node(f"Раздел 9. Заголовок\n{body}",
-                     [_ann("bold", 0, 18, True),
-                      _ann("size", 0, 18, "16"),
-                      *[]])
-        root = promote_headers(self._root([node]), threshold=4.0)
-        types = [c.type for c in root.children]
-        assert "header" in types
-        header = next(c for c in root.children if c.type == "header")
-        assert "Раздел 9" in header.text
-        assert body[:20] not in header.text
-
-
-def _parse_fixture(path, tmp_path, monkeypatch, threshold=4.0):
-    from rag_parser.core.config import settings
-    from rag_parser.parsers.dedoc_parser import DedocParser
-
-    monkeypatch.setattr(
-        settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
+    @pytest.mark.parametrize(
+        "text,raw_level",
+        [
+            ("1", 1),
+            ("1)", 1),
+            ("1. Название", 1),
+            ("1.1", 2),
+            ("1.1 Название", 2),
+            ("2.3 Анализ", 2),
+            ("1.1.1", 3),
+            ("1.1.1 Название", 3),
+            ("1.1.1.1", 4),
+            ("1.1.1.1.1 Глубоко", 5),
+        ],
     )
-    return DedocParser(header_threshold=threshold).parse(path)
+    def test_raw_level_from_dots(self, text, raw_level):
+        assert numbering_level(text) == raw_level
+        is_header, actual = classify_header(text)
+        assert is_header is True and actual == raw_level
+
+    def test_number_must_be_delimited(self):
+        """«1abc» — цифра неотделима от текста, нумерации нет."""
+        assert numbering_level("1abc") is None
+        assert classify_header("1abc")[0] is False
+
+    def test_no_numbering(self):
+        assert numbering_level("Обычный текст") is None
+
+    def test_paren_suppressed_when_disallowed(self):
+        """Ветка N) подавляется в «Раздел N»-документах (allow_paren=False)."""
+        assert numbering_level("1) пункт", allow_paren=False) is None
+        assert classify_header("1) пункт", allow_paren=False)[0] is False
+        # Остальная нумерация при этом работает
+        assert numbering_level("1.1. Пункт", allow_paren=False) == 2
 
 
-class TestFixtures:
-    def test_styled_doc(self, header_docs, tmp_path, monkeypatch):
-        result = _parse_fixture(header_docs["styled"], tmp_path, monkeypatch)
-        assert result.tree is not None
-        from rag_parser.parsers.dedoc_tree import collect_headers
+class TestPlainText:
+    """Обычный текст не становится заголовком."""
 
-        headers = collect_headers(result.tree)
-        texts = [h.text for h in headers]
-        assert any("Раздел 1" in t for t in texts)
-        assert any("Метрики" in t for t in texts)
-
-    def test_unstyled_doc(self, header_docs, tmp_path, monkeypatch):
-        result = _parse_fixture(header_docs["unstyled"], tmp_path, monkeypatch)
-        assert result.tree is not None
-        from rag_parser.parsers.dedoc_tree import collect_headers
-
-        headers = collect_headers(result.tree)
-        texts = [h.text for h in headers]
-        assert any("Раздел 2" in t for t in texts), texts
-        assert any("Детализация" in t for t in texts), texts
-
-    def test_threshold_changes_count(self, header_docs, tmp_path, monkeypatch):
-        from rag_parser.parsers.dedoc_tree import collect_headers
-
-        low = _parse_fixture(
-            header_docs["unstyled"], tmp_path, monkeypatch, threshold=0.0
-        )
-        high = _parse_fixture(
-            header_docs["unstyled"], tmp_path, monkeypatch, threshold=8.0
-        )
-        assert len(collect_headers(low.tree)) > len(collect_headers(high.tree))
-
-    def test_annual_report_style(self, annual_report_doc, tmp_path, monkeypatch):
-        """E2E в стиле 2023.docx: TOC подавлен, тело структурировано, lift."""
-        from rag_parser.parsers.dedoc_tree import collect_headers
-
-        result = _parse_fixture(annual_report_doc, tmp_path, monkeypatch)
-        assert result.tree.metadata["toc_suppressed"] == 6
-        assert result.tree.metadata["paren_suppressed"] == 3
-
-        flat = []
-        stack = [result.tree]
-        while stack:
-            current = stack.pop(0)
-            flat.append(current)
-            stack.extend(current.children)
-        toc = [n for n in flat if "оглавления" in n.text]
-        assert len(toc) == 6
-        assert all(n.type != "header" for n in toc)
-
-        headers = collect_headers(result.tree)
-        by_text = {h.text: h for h in headers}
-        r1 = next(h for t, h in by_text.items() if t.startswith("Раздел 1. Инфор"))
-        r2 = next(h for t, h in by_text.items() if t.startswith("Раздел 2."))
-        assert r1.level == 1 and r2.level == 1
-        items = [n for n in flat if "утвержден" in n.text or "достоверность" in n.text]
-        assert items and all(n.type != "header" for n in items)
-
-        parents = _parent_map(result.tree)
-        assert parents[id(r2)] is result.tree  # lift в корень
-        sub = next(h for h in headers if h.text.startswith("2.1."))
-        assert sub.level == 2
-        assert parents[id(sub)] is r2
-
-
-def _parent_map(root):
-    mapping = {}
-
-    def visit(node, parent):
-        mapping[id(node)] = parent
-        for child in node.children:
-            visit(child, node)
-
-    visit(root, None)
-    return mapping
-
-
-def _hnode(text):
-    return DocumentNode(
-        type="header", level=1, text=text, children=[], metadata={},
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Абзац документа с обычным текстом.",
+            "Это длинный текст без каких-либо признаков заголовка вообще.",
+            "Таблица показывает значения 1, 2 и 3 по регионам страны.",
+            "первый",
+            "",
+            "   ",
+        ],
     )
+    def test_not_a_header(self, text):
+        is_header, level = classify_header(text)
+        assert is_header is False
+        assert level is None
+
+    def test_bold_partially_is_not_enough(self):
+        """Выделенный термин — не заголовок.
+
+        Жирным должен быть почти весь текст строки (``bold``-аннотация
+        покрывает >= ``BOLD_HEADING_COVERAGE``). У термина жирно только
+        начало, поэтому строка остаётся абзацем.
+        """
+        text = "ПДн — персональные данные"
+        annotations = [{"name": "bold", "start": 0, "end": 3, "value": "True"}]
+        assert classify_header(text, annotations)[0] is False
+
+    def test_bold_value_false_is_not_enough(self):
+        text = "Жирный абзац"
+        annotations = [
+            {"name": "bold", "start": 0, "end": len(text), "value": "False"}
+        ]
+        assert classify_header(text, annotations)[0] is False
+
+    def test_short_line_alone_is_not_enough(self):
+        """Раньше короткая строка давала балл; теперь — нет."""
+        assert classify_header("Коротко")[0] is False
 
 
-class TestRebuild:
-    def _root(self, children):
-        return DocumentNode(type="document", level=0, text="",
-                            children=children, metadata={})
+class TestPromoteIntegration:
+    """Интеграция: promote_headers применяет правила к дереву."""
 
-    def test_buried_header_lifted_to_root(self):
-        """Погребение из dedoc-вложенности: Раздел 2 ребёнком 3) → корень."""
-        n3 = _node("3) годовой отчет утвержден собранием акционеров")
-        n3.children.append(_node("Раздел 2. Финансовые показатели"))
-        n1 = _node("Раздел 1. Информация о годовом отчете")
-        n1.children.append(n3)
-        root = promote_headers(self._root([n1]), threshold=4.0)
-        parents = _parent_map(root)
-        flat = []
-        stack = [root]
-        while stack:
-            current = stack.pop(0)
-            flat.append(current)
-            stack.extend(current.children)
-        razdel2 = next(n for n in flat if "Раздел 2" in n.text)
-        assert razdel2.type == "header" and razdel2.level == 1
-        assert parents[id(razdel2)] is root  # lift, а не погребение
+    def _tree(self):
+        from rag_parser.core.interfaces import DocumentNode
 
-    def test_level_zero_header_does_not_swallow(self):
-        odd = DocumentNode(type="header", level=0, text="Странный",
-                           children=[], metadata={})
-        para = _node("Обычный абзац тела документа без признаков.")
-        other = _hnode("Настоящий")
-        root = promote_headers(self._root([odd, para, other]), threshold=8.0)
-        parents = _parent_map(root)
-        flat = []
-        stack = [root]
-        while stack:
-            current = stack.pop(0)
-            flat.append(current)
-            stack.extend(current.children)
-        found = next(n for n in flat if n.text.startswith("Обычный"))
-        assert parents[id(found)] is root  # не поглощён L0-узлом
+        def node(node_type, text, children=None, level=1):
+            return DocumentNode(
+                type=node_type, level=level, text=text,
+                children=children or [], metadata={},
+            )
 
-    def test_table_between_header_and_subheader(self):
-        table = DocumentNode(type="table", level=0, text="| A |\n|---|\n| 1 |",
-                             children=[], metadata={})
-        h2 = _node("Раздел 2. Сведения")
-        sub = _node("2.1. Реквизиты общества с ограниченной ответственностью")
-        body = _node("Текст тела абзаца про реквизиты общества.")
-        h2.children.extend([table, sub])
-        sub.children.append(body)
-        root = promote_headers(self._root([h2]), threshold=4.0)
-        parents = _parent_map(root)
-        flat = []
-        stack = [root]
-        while stack:
-            current = stack.pop(0)
-            flat.append(current)
-            stack.extend(current.children)
-        table_node = next(n for n in flat if n.type == "table")
-        h2_node = next(n for n in flat if "Раздел 2" in n.text)
-        assert parents[id(table_node)] is h2_node  # в Разделе 2, не в корне
+        return node(
+            "document", "",
+            children=[
+                node("raw_text", "1. Область применения"),
+                node("raw_text", "Текст первого раздела."),
+                node("raw_text", "1.1 Подраздел"),
+                node("raw_text", "Текст подраздела."),
+                node("raw_text", "Заключение"),
+            ],
+            level=0,
+        )
+
+    def test_headers_created_by_rules(self):
+        result = promote_headers(self._tree())
+        headers = {n.text.strip(): n.level for n in _walk_headers(result)}
+        assert "1. Область применения" in headers
+        assert headers["1. Область применения"] == 1
+        assert "1.1 Подраздел" in headers
+        assert headers["1.1 Подраздел"] == 2
+        assert "Заключение" in headers
+
+    def test_plain_text_stays_paragraph(self):
+        result = promote_headers(self._tree())
+        texts = [n.text for n in _walk_all(result)]
+        assert any("Текст первого раздела." in t for t in texts)
+        header_texts = {n.text.strip() for n in _walk_headers(result)}
+        assert not any("Текст первого раздела." in h for h in header_texts)
+
+    def test_threshold_argument_is_ignored(self):
+        """DEPRECATED-параметр принимается, но на результат не влияет."""
+        low = promote_headers(self._tree(), threshold=0.0)
+        high = promote_headers(self._tree(), threshold=8.0)
+        assert [n.text for n in _walk_all(low)] == [n.text for n in _walk_all(high)]
+        assert [n.level for n in _walk_all(low)] == [n.level for n in _walk_all(high)]
+
+
+def _walk_all(node):
+    yield node
+    for child in node.children:
+        yield from _walk_all(child)
+
+
+def _walk_headers(node):
+    for item in _walk_all(node):
+        if item.type == "header":
+            yield item
+
+class TestHeaderLevelTracker:
+    """Уровень по состоянию документа: углубление против соседства."""
+
+    @pytest.mark.parametrize(
+        "sequence,expected_levels",
+        [
+            # Базовые случаи
+            (["1 Текст", "1.1 Текст", "1.2 Текст"], [1, 2, 2]),  # Сброс
+            (["1 Текст", "1.1 Текст", "1.1.1 Текст"], [1, 2, 3]),  # Углубление
+            (
+                ["1 Текст", "1.1 Текст", "1.1.1 Текст", "1.1.1.1 Текст"],
+                [1, 2, 3, 3],
+            ),  # Обрезка
+            # Сложные случаи
+            (
+                ["1 Текст", "1.1 Текст", "1.2 Текст", "1.2.1 Текст", "1.2.2 Текст"],
+                [1, 2, 2, 3, 3],
+            ),
+            (
+                ["1 Текст", "1.1 Текст", "2 Текст", "2.1 Текст"],
+                [1, 2, 1, 2],
+            ),  # Новый базовый
+            # Триггеры без нумерации
+            (["1 Текст", "**Подраздел**", "***Вложенный***"], [1, 2, 3]),
+            (["1 Текст", "Раздел 1.1", "Глава 1.1.1"], [1, 2, 3]),
+        ],
+    )
+    def test_header_level_calculation(self, sequence, expected_levels):
+        tracker = HeaderLevelTracker()
+        levels = [tracker.calculate_level(text) for text in sequence]
+        assert levels == expected_levels
+
+    def test_max_level_constant(self):
+        assert MAX_HEADER_LEVEL == 3
+
+    def test_siblings_do_not_deepen(self):
+        """«1.1» и «1.2» — соседи одного уровня, а не цепочка."""
+        tracker = HeaderLevelTracker()
+        assert tracker.calculate_level("1 Введение") == 1
+        assert tracker.calculate_level("1.1 Первый") == 2
+        assert tracker.calculate_level("1.2 Второй") == 2
+        assert tracker.calculate_level("1.3 Третий") == 2
+
+    def test_depth_is_capped(self):
+        """Ни один заголовок не опускается глубже третьего уровня."""
+        tracker = HeaderLevelTracker()
+        levels = [
+            tracker.calculate_level(text)
+            for text in ("1", "1.1", "1.1.1", "1.1.1.1", "1.1.1.1.1", "1.1.1.1.1.1")
+        ]
+        assert levels == [1, 2, 3, 3, 3, 3]
+
+    def test_siblings_inherit_the_previous_level(self):
+        """РЕГРЕССИЯ: сосед наследует УРОВЕНЬ, а не сбрасывается в 2.
+
+        После скользящего окна стек равен [(2, «6.2»), (3, «6.2.2»)].
+        Раньше соседство с «6.2.2» жёстко давало 2, и «6.2.3» получал
+        уровень 2 вместо 3 — уровень «прыгал» внутри одного оглавления.
+        """
+        tracker = HeaderLevelTracker()
+        levels = [
+            tracker.calculate_level(text)
+            for text in (
+                "6 Структура документа",
+                "6.2 Элементы структуры",
+                "6.2.1 Категории данных",
+                "6.2.2 Квалификаторы идентификации",
+                "6.2.3 Области использования",
+            )
+        ]
+        assert levels == [1, 2, 3, 3, 3]
+
+    def test_tracker_is_per_document(self):
+        """Новый экземпляр начинает с чистого состояния."""
+        first = HeaderLevelTracker()
+        for text in ("1", "1.1", "1.1.1"):
+            first.calculate_level(text)
+        second = HeaderLevelTracker()
+        assert second.level_stack == []
+        assert second.calculate_level("1.1.1.1 Глубоко") == 1
+
+    def test_reset_clears_stack(self):
+        tracker = HeaderLevelTracker()
+        tracker.calculate_level("1 Введение")
+        tracker.calculate_level("1.1 Первый")
+        tracker.reset()
+        assert tracker.level_stack == []
+
+    def test_base_header_detection(self):
+        assert HeaderLevelTracker.is_base_header("1 ОБЛАСТЬ ПРИМЕНЕНИЯ") is True
+        assert HeaderLevelTracker.is_base_header("1 **Область применения**") is True
+        assert HeaderLevelTracker.is_base_header("1 Текст") is False
+
+    def test_trigger_detection(self):
+        assert HeaderLevelTracker.detect_trigger("1.1 Текст") == "numbered"
+        assert HeaderLevelTracker.detect_trigger("**Подраздел**") == "bold"
+        assert HeaderLevelTracker.detect_trigger("Раздел 1.1") == "keyword"
+        assert HeaderLevelTracker.detect_trigger("Обычный текст") is None
+
+    def test_extract_number(self):
+        assert HeaderLevelTracker.extract_number("1.2.1 Название") == "1.2.1"
+        assert HeaderLevelTracker.extract_number("Раздел 1.1") == ""
+
+
+class TestBoldTrigger:
+    """Триггер жирного текста и его очистка из результата."""
+
+    @pytest.mark.parametrize(
+        "text,cleaned",
+        [
+            ("**Подраздел**", "Подраздел"),
+            ("__BOLD__Текст__BOLD__ и конец", "Текст и конец"),
+            ("<b>Жирно</b>", "Жирно"),
+            ("обычный текст", "обычный текст"),
+            # Инлайновый жирный внутри строки маркерами НЕ считается:
+            # снимать края можно только если строка обёрнута целиком.
+            ("**жирный** внутри", "**жирный** внутри"),
+        ],
+    )
+    def test_strip_bold_markers(self, text, cleaned):
+        assert strip_bold_markers(text) == cleaned
+
+    def test_bold_line_is_a_header(self):
+        is_header, level = classify_header("**Подраздел**")
+        assert is_header is True
+        # Уровень задаёт трекер, а не классификатор
+        assert level is None
+
+
+class TestDepthCap:
+    """Итоговый уровень в дереве ограничен тремя."""
+
+    def _document(self, lines):
+        return DocumentNode(
+            type="document",
+            level=0,
+            text="",
+            children=[
+                DocumentNode(
+                    type="raw_text", level=1, text=text, children=[], metadata={}
+                )
+                for text in lines
+            ],
+            metadata={},
+        )
+
+    def _levels(self, root):
+        found = []
+
+        def walk(node):
+            if node.type == "header":
+                found.append((node.text.strip(), node.level))
+            for child in node.children:
+                walk(child)
+
+        walk(root)
+        return found
+
+    @pytest.mark.parametrize(
+        "lines,expected",
+        [
+            (["1 Текст", "1.1 Текст", "1.2 Текст"], [1, 2, 2]),
+            (["1 Текст", "1.1 Текст", "1.1.1 Текст", "1.1.1.1 Текст"], [1, 2, 3, 3]),
+            (["1 Текст", "1.1 Текст", "2 Текст", "2.1 Текст"], [1, 2, 1, 2]),
+            (["1 Текст", "**Подраздел**", "***Вложенный***"], [1, 2, 3]),
+        ],
+    )
+    def test_document_levels(self, lines, expected):
+        result = promote_headers(self._document(lines))
+        assert [level for _, level in self._levels(result)] == expected
+
+    def test_deep_numbering_is_capped_in_tree(self):
+        """"1.1.1.1" — четвёртый уровень по точкам, но в дереве максимум 3."""
+        result = promote_headers(
+            self._document(["1", "1.1", "1.1.1", "1.1.1.1 Глубоко"])
+        )
+        levels = [level for _, level in self._levels(result)]
+        assert levels == [1, 2, 3, 3]
+        assert max(levels) == MAX_HEADER_LEVEL
+
+
+class TestBoldFromDocxAnnotations:
+    """Проблема 1: жирность в DOCX приходит аннотациями, не текстом."""
+
+    def _bold(self, length, value="True"):
+        return [{"name": "bold", "start": 0, "end": length, "value": value}]
+
+    def test_fully_bold_line_is_header(self):
+        text = "Предисловие"
+        assert classify_header(text, self._bold(len(text)))[0] is True
+
+    def test_numbered_bold_is_header_level_one(self):
+        text = "1 Область применения"
+        is_header, level = classify_header(text, self._bold(len(text)))
+        assert is_header is True and level == 1
+
+    def test_bold_cover_threshold(self):
+        """Граница 90%: 8 из 10 символов жирно — ещё термин, 10 из 10 — заголовок.
+
+        Текст без цифр в начале, иначе сработало бы правило 7 (нумерация).
+        """
+        text = "абвгдеёжзий"
+        almost = [{"name": "bold", "start": 0, "end": 8, "value": "True"}]
+        whole = [{"name": "bold", "start": 0, "end": 10, "value": "True"}]
+        assert classify_header(text, almost)[0] is False
+        assert classify_header(text, whole)[0] is True
+
+    def test_no_annotations_means_no_bold(self):
+        assert classify_header("Предисловие", [])[0] is False
+
+    def test_bold_header_in_docx(self, tmp_path):
+        """Сквозной тест на настоящем DOCX без стилей Heading."""
+        docx = pytest.importorskip("docx")
+        from rag_parser.parsers.dedoc_parser import DedocParser
+
+        document = docx.Document()
+        run = document.add_paragraph().add_run("Предисловие")
+        run.bold = True
+        document.add_paragraph().add_run("Обычный абзац текста без жирности.")
+        term = document.add_paragraph()
+        term_run = term.add_run("ПДн")
+        term_run.bold = True
+        term.add_run(" — персональные данные.")
+        source = tmp_path / "bold.docx"
+        document.save(source)
+
+        tree = DedocParser().parse(source).tree
+
+        def collect(node):
+            found = []
+            if node.type == "header":
+                found.append(node.text.strip())
+            for child in node.children:
+                found.extend(collect(child))
+            return found
+
+        titles = collect(tree)
+        assert "Предисловие" in titles
+        # выделенный термин заголовком не стал
+        assert not any("ПДн" in title for title in titles)
 
 
 class TestTocSuppression:
-    def _root(self, children):
-        return DocumentNode(type="document", level=0, text="",
-                            children=children, metadata={})
+    """Проблема 2: записи оглавления не должны становиться заголовками."""
 
-    def _toc_fixture(self):
-        children = [_node(f"Раздел {i}. Строка оглавления документа")
-                    for i in range(1, 7)]
-        children.append(_node("Раздел 1. Тело первого раздела документа"))
-        children.append(_node("Текст тела первого раздела."))
-        children.append(_node("Раздел 2. Тело второго раздела документа"))
-        return children
+    def _document(self, lines):
+        return DocumentNode(
+            type="document",
+            level=0,
+            text="",
+            children=[
+                DocumentNode(
+                    type="raw_text", level=1, text=text, children=[], metadata={}
+                )
+                for text in lines
+            ],
+            metadata={},
+        )
 
-    def test_toc_lines_stay_paragraph(self):
-        root = promote_headers(self._root(self._toc_fixture()), threshold=4.0)
-        assert root.metadata["toc_suppressed"] == 6
-        toc = [c for c in root.children
-               if "оглавления" in c.text or "Оглавление" in c.text
-               or "Строка оглавления" in c.text]
-        assert len(toc) == 6
-        assert all(c.type != "header" for c in toc)
+    def _titles(self, root):
+        found = []
 
-    def test_body_headers_promoted(self):
-        root = promote_headers(self._root(self._toc_fixture()), threshold=4.0)
-        headers = [c for c in root.children if c.type == "header"]
-        texts = [h.text for h in headers]
-        assert any("Тело первого" in t for t in texts)
-        assert any("Тело второго" in t for t in texts)
+        def walk(node):
+            if node.type == "header":
+                found.append(node.text.strip())
+            for child in node.children:
+                walk(child)
 
-    def test_short_series_not_suppressed(self):
-        children = [_node(f"Раздел {i}. Короткая серия") for i in range(1, 4)]
-        root = promote_headers(self._root(children), threshold=4.0)
-        assert root.metadata["toc_suppressed"] == 0
-        assert any(c.type == "header" for c in root.children)
+        walk(root)
+        return found
 
-    def test_paren_suppressed_with_razdel(self):
-        children = [_node("Раздел 1. Первый"), _node("3) пункт перечня"),
-                    _node("Раздел 2. Второй")]
-        root = promote_headers(self._root(children), threshold=4.0)
-        assert root.metadata["paren_suppressed"] >= 1
-        flat = []
-        stack = [root]
+    def test_toc_entries_are_paragraphs(self):
+        lines = ["Содержание", "1 Область применения … 1", "5 Общие положения … 3",
+                 "5.1 Первое положение … 4", "5.2 Второе положение … 5",
+                 "6 Структура документа … 5", "7 Правила применения … 9",
+                 "1 Область применения", "Текст первого раздела."]
+        result = promote_headers(self._document(lines))
+        titles = self._titles(result)
+        assert not any("…" in title for title in titles), titles
+        # настоящие разделы остались заголовками
+        assert "1 Область применения" in titles
+
+    def test_toc_heading_itself_stays_header(self):
+        result = promote_headers(self._document(["Содержание", "1 Раздел … 1"]))
+        assert "Содержание" in self._titles(result)
+
+    def test_short_list_is_not_treated_as_toc(self):
+        """Меньше TOC_SERIES_MIN записей — это обычный текст, не оглавление."""
+        lines = ["Содержание", "1 Раздел … 1", "1 Тема", "Текст."]
+        result = promote_headers(self._document(lines))
+        assert "Содержание" in self._titles(result)
+
+    def test_numbered_text_without_page_marker_is_kept(self):
+        """Номер без маркера страницы — обычный заголовок, а не запись ТОС."""
+        lines = ["Содержание", "1 Раздел … 1", "2 Раздел … 2", "3 Раздел … 3",
+                 "4 Раздел … 4", "5 Раздел … 5", "1 Область применения"]
+        result = promote_headers(self._document(lines))
+        assert "1 Область применения" in self._titles(result)
+
+    def test_counter_is_reported(self):
+        lines = ["Содержание"] + [f"{n} Раздел … {n}" for n in range(1, 7)]
+        result = promote_headers(self._document(lines))
+        assert result.metadata.get("toc_suppressed") == 6
+
+    def test_real_txt_has_no_toc_headers(self):
+        """Проверка на настоящем gost_report.txt."""
+        from pathlib import Path
+
+        from rag_parser.parsers.dedoc_parser import DedocParser
+
+        source = Path(__file__).resolve().parent.parent.parent / "input" / "gost_report.txt"
+        if not source.exists():
+            pytest.skip("файл отсутствует в input/")
+
+        titles = self._titles(DedocParser().parse(source).tree)
+        assert not any("…" in title for title in titles)
+        assert len(titles) < 56  # раньше 19 записей оглавления были заголовками
+
+
+class TestMarkupFormatsKeepAuthoritativeLevels:
+    """Проблема 4: кап 3 уровней не должен просачиваться в разметочные форматы."""
+
+    def test_md_levels_match_headings(self):
+        """Уровни .md совпадают с глубиной ``#`` в исходнике."""
+        import re
+        from pathlib import Path
+
+        from rag_parser.parsers.dedoc_parser import DedocParser
+
+        source = Path(__file__).resolve().parent.parent.parent / "input" / "gost_report.md"
+        if not source.exists():
+            pytest.skip("файл отсутствует в input/")
+
+        depths = [
+            len(mark.group(1))
+            for line in source.read_text(encoding="utf-8").split("\n")
+            if (mark := re.match(r"^(#+) ", line))
+        ]
+
+        result = DedocParser().parse(source)
+        levels = []
+        stack = [result.tree]
         while stack:
-            current = stack.pop(0)
-            flat.append(current)
-            stack.extend(current.children)
-        items = [n for n in flat if "пункт перечня" in n.text]
-        assert items and all(n.type != "header" for n in items)
+            node = stack.pop(0)
+            if node.type == "header":
+                levels.append(node.level)
+            stack = list(node.children) + stack
 
-    def test_paren_suppressed_at_zero_threshold(self):
-        """Супрессия абсолютна: порог 0.0 не промоутит N) в Раздел-документе."""
-        children = [_node("Раздел 1. Первый"), _node("3) пункт перечня"),
-                    _node("Раздел 2. Второй")]
-        root = promote_headers(self._root(children), threshold=0.0)
-        flat = []
-        stack = [root]
+        assert len(levels) == len(depths)
+        assert sorted(levels) == sorted(depths)
+        assert max(levels) >= 4, "уровень 4 из h4 обязан сохраниться"
+
+
+class TestTxtNesting:
+    """Проблема 5: вложенность в TXT."""
+
+    def test_real_txt_nested_levels(self):
+        from pathlib import Path
+
+        from rag_parser.parsers.dedoc_parser import DedocParser
+
+        source = Path(__file__).resolve().parent.parent.parent / "input" / "gost_report.txt"
+        if not source.exists():
+            pytest.skip("файл отсутствует в input/")
+
+        result = DedocParser().parse(source)
+        levels = set()
+        stack = [result.tree]
         while stack:
-            current = stack.pop(0)
-            flat.append(current)
-            stack.extend(current.children)
-        items = [n for n in flat if "пункт перечня" in n.text]
-        assert items and all(n.type != "header" for n in items)
-
-    def test_paren_without_razdel_promotes(self):
-        children = [_node("1) первый пункт"), _node("2) второй пункт")]
-        root = promote_headers(self._root(children), threshold=4.0)
-        assert root.metadata["paren_suppressed"] == 0
-        assert sum(1 for c in root.children if c.type == "header") == 2
+            node = stack.pop(0)
+            if node.type == "header":
+                levels.add(node.level)
+            stack = list(node.children) + stack
+        assert {1, 2, 3} <= levels

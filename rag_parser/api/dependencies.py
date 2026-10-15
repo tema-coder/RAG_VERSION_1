@@ -57,16 +57,12 @@ def supported_extensions() -> list:
     return sorted(PARSERS.keys())
 
 
-def get_parser(
-    filename: str, header_threshold: Optional[float] = None
-) -> BaseParser:
+def get_parser(filename: str) -> BaseParser:
     extension = Path(filename).suffix.lower()
     parser_class = PARSERS.get(extension)
     if parser_class is None:
         raise UnsupportedFormatError(extension, settings.supported_extensions_set)
-    if header_threshold is None:
-        header_threshold = settings.HEADER_PROMOTION_THRESHOLD
-    return parser_class(header_threshold=header_threshold)
+    return parser_class()
 
 
 def get_chunker(

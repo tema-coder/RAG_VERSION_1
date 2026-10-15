@@ -28,10 +28,11 @@
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import orjson
 
+from rag_parser.core.config import settings
 from rag_parser.core.interfaces import (
     BaseParser,
     DocumentParseError,
@@ -65,6 +66,19 @@ TEXT_ALIAS_EXTENSIONS: Dict[str, str] = {
 
 #: Расширения, требующие LibreOffice (конвертация в DOCX средствами dedoc).
 LIBREOFFICE_EXTENSIONS = (".doc", ".odt", ".rtf")
+
+#: Форматы, которые идут через HTML-маршрут (HtmlReader + маркеры таблиц).
+#: ``.html`` — напрямую; остальные конвертируются в HTML предобработчиками
+#: ``.md`` (mistune), ``.xml`` (xml_preprocessor), ``.txt`` (детектор таблиц).
+HTML_DERIVED_EXTENSIONS = (".html", ".htm", ".md", ".xml", ".txt")
+
+#: Подмножество ``HTML_DERIVED_EXTENSIONS``, где разметка источника сама
+#: задаёт структуру (h1-h6, ``<section>``). Для них жёсткие правила
+#: ``header_promoter`` НЕ применяются: dedoc уже расставил типы и уровни,
+#: а правила подняли бы нумерованные пункты списка до заголовков.
+#: ``.txt`` сюда НЕ входит — заголовки в нём выглядят как обычные строки,
+#: их по-прежнему распознаёт ``header_promoter``.
+MARKUP_AUTHORITATIVE_EXTENSIONS = (".html", ".htm", ".md", ".xml")
 
 TREE_FILE_PREFIX = "raw_dedoc_tree"
 MARKDOWN_FILE_PREFIX = "parsed"
@@ -198,7 +212,9 @@ def prepare_manager_for_format(extension: str) -> Any:
 
 def libreoffice_available() -> bool:
     """Есть ли ``soffice`` в PATH (нужен для .doc/.odt/.rtf)."""
-    return shutil.which("soffice") is not None or shutil.which("libreoffice") is not None
+    return (
+        shutil.which("soffice") is not None or shutil.which("libreoffice") is not None
+    )
 
 
 def require_libreoffice(extension: str, filename: str) -> None:
@@ -218,26 +234,91 @@ def require_libreoffice(extension: str, filename: str) -> None:
     )
 
 
-def prepare_for_parsing(path: Path) -> Tuple[Path, str, Optional[Path]]:
+class PreparedInput(NamedTuple):
+    """Результат подготовки файла к разбору.
+
+    :param path: путь, который нужно отдать dedoc;
+    :param extension: расширение для выбора ридера;
+    :param temp_path: временный файл, который обязан удалить вызывающий;
+    :param html_tables: markdown-таблицы, извлечённые из HTML нами
+        (для последующей привязки по маркерам, см.
+        ``dedoc_tree.attach_tables_by_position``).
+    """
+
+    path: Path
+    extension: str
+    temp_path: Optional[Path]
+    html_tables: List[str]
+
+
+def prepare_for_parsing(path: Path) -> PreparedInput:
     """Готовит файл к разбору dedoc.
 
-    Возвращает ``(путь_для_dedoc, расширение_для_dedoc, временный_файл)``.
-
-    Для форматов из ``TEXT_ALIAS_EXTENSIONS`` (``.md``) делается копия с
-    расширением ``.txt`` — dedoc такие файлы не умеет. Вызывающий обязан
-    удалить ``временный_файл`` (если он не ``None``) в ``finally``.
+    Для HTML-производных (``HTML_DERIVED_EXTENSIONS``) таблицы
+    извлекаются заранее и заменяются маркерами-абзацами — иначе
+    ``HtmlReader`` не даёт ни позиции таблиц, ни ``TableAnnotation``
+    (см. ``parsers.html_preprocessor``).
     """
     extension = path.suffix.lower()
+
+    if extension in (".html", ".htm", ".md", ".xml", ".txt"):
+
+        if extension == ".md":
+            from rag_parser.parsers.markdown_preprocessor import (
+                prepare_markdown_for_dedoc,
+            )
+
+            target_dir = settings.ensure_temp_dir()
+            temp_path, tables = prepare_markdown_for_dedoc(path, target_dir)
+            if temp_path == path:
+                # файл не читается как текст — нечего конвертировать
+                return PreparedInput(path, ".txt", None, [])
+            return PreparedInput(temp_path, ".html", temp_path, tables)
+
+        if extension == ".xml":
+            from rag_parser.parsers.xml_preprocessor import prepare_xml_for_dedoc
+
+            target_dir = settings.ensure_temp_dir()
+            temp_path, tables = prepare_xml_for_dedoc(path, target_dir)
+            if temp_path is None:
+                # невалидный XML — не мешаем dedoc разобрать его самому
+                return PreparedInput(path, ".txt", None, [])
+            return PreparedInput(temp_path, ".html", temp_path, tables)
+
+        if extension == ".txt":
+            from rag_parser.parsers.text_preprocessor import prepare_text_for_dedoc
+
+            target_dir = settings.ensure_temp_dir()
+            temp_path, tables = prepare_text_for_dedoc(path, target_dir)
+            if temp_path is None:
+                # таблиц нет — нативный RawTextReader лучше сохраняет
+                # переносы строк, чем наша HTML-обёртка
+                return PreparedInput(path, ".txt", None, [])
+            return PreparedInput(temp_path, ".html", temp_path, tables)
+
+        from rag_parser.parsers.html_preprocessor import inject_table_markers
+
+        try:
+            html = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return PreparedInput(path, extension, None, [])
+        marked, tables = inject_table_markers(html)
+        if not tables:
+            return PreparedInput(path, extension, None, [])
+        target_dir = settings.ensure_temp_dir()
+        temp_path = target_dir / f"{path.stem}_marked{extension}"
+        temp_path.write_text(marked, encoding="utf-8")
+        return PreparedInput(temp_path, ".html", temp_path, tables)
+
     alias = TEXT_ALIAS_EXTENSIONS.get(extension)
     if alias is None:
-        return path, extension, None
+        return PreparedInput(path, extension, None, [])
 
-    from rag_parser.core.config import settings
 
     target_dir = settings.ensure_temp_dir()
     alias_path = target_dir / f"{path.stem}{alias}"
     shutil.copyfile(path, alias_path)
-    return alias_path, alias, alias_path
+    return PreparedInput(alias_path, alias, alias_path, [])
 
 
 def dedoc_version() -> str:
@@ -275,6 +356,12 @@ def parameters_for_format(extension: str, file_path: Path) -> Dict[str, str]:
         "with_attachments": "false",
         "structure_type": "tree",
     }
+    if extension in HTML_DERIVED_EXTENSIONS:
+        # КРИТИЧНО для HTML-маршрута: без этого флага dedoc ПОЛНОСТЬЮ
+        # отбрасывает таблицы, у которых нет атрибута border= (а mistune
+        # и наш xml/txt-препроцессоры его не проставляют). Таблица не
+        # просто остаётся нераспознанной — она исчезает из вывода.
+        params["handle_invisible_table"] = "true"
     if extension == ".pdf":
         params["pdf_with_text_layer"] = "true"
     if extension in (".csv", ".tsv"):
@@ -327,7 +414,9 @@ def convert_xls_to_xlsx(source: Path) -> Path:
         first = False
         target.title = sheet.name[:31] or "Sheet"
         for row_idx in range(sheet.nrows):
-            target.append([sheet.cell_value(row_idx, col) for col in range(sheet.ncols)])
+            target.append(
+                [sheet.cell_value(row_idx, col) for col in range(sheet.ncols)]
+            )
         for rlo, rhi, clo, chi in sheet.merged_cells:
             target.merge_cells(
                 start_row=rlo + 1,
@@ -361,8 +450,11 @@ class DedocParser(BaseParser):
     format = "dedoc"
     extensions = tuple(SUPPORTED_EXTENSIONS)
 
-    def __init__(self, header_threshold: Optional[float] = None) -> None:
-        self.header_threshold = header_threshold
+    def __init__(
+        self,
+        header_threshold: Optional[float] = None,  # noqa: ARG002 - DEPRECATED
+    ) -> None:
+        """Параметр header_threshold DEPRECATED и игнорируется."""
 
     def supported_extensions(self) -> List[str]:
         return list(SUPPORTED_EXTENSIONS)
@@ -395,20 +487,33 @@ class DedocParser(BaseParser):
         self._validate_container(path, extension)
         require_libreoffice(extension, path.name)
 
-        # Подготовка пути: .xls -> .xlsx своей конвертацией, .md -> .txt
-        # (dedoc не знает markdown; полагаться на его недокументированный
-        # откат text/markdown -> text/plain нельзя).
+        # Подготовка пути: .xls -> .xlsx своей конвертацией, .md -> .txt,
+        # HTML -> HTML с маркерами таблиц (dedoc не знает markdown и не
+        # даёт позиций таблиц в HTML).
         converted: Optional[Path] = None
+        html_tables: List[str] = []
         effective_path = path
         effective_extension = extension
         if extension == ".xls":
             converted = convert_xls_to_xlsx(path)
             effective_path = converted
             effective_extension = ".xlsx"
+        elif extension == ".pdf" and settings.PDF_VIA_DOCX:
+            # Опциональный маршрут PDF -> DOCX (за флагом PDF_VIA_DOCX).
+            # Конвертер искажает структуру, поэтому включать только осознанно;
+            # см. README, «Ограничения PDF», и scripts/debug_pdf_via_docx.py.
+            from rag_parser.parsers.pdf_via_docx import convert_pdf_to_docx
+
+            converted = convert_pdf_to_docx(path, settings.ensure_temp_dir())
+            if converted is not None:
+                effective_path = converted
+                effective_extension = ".docx"
         else:
-            effective_path, effective_extension, alias_copy = prepare_for_parsing(path)
-            if alias_copy is not None:
-                converted = alias_copy
+            prepared = prepare_for_parsing(path)
+            effective_path = prepared.path
+            effective_extension = prepared.extension
+            html_tables = prepared.html_tables
+            converted = prepared.temp_path
 
         try:
             manager = prepare_manager_for_format(effective_extension)
@@ -453,10 +558,27 @@ class DedocParser(BaseParser):
         structure = content.get("structure") or {}
 
         full_root = build_full_tree(structure, None)
-        full_root = promote_headers(full_root, threshold=self.header_threshold)
+        # Для форматов с авторской разметкой (h1-h6, <section>) типы и
+        # уровни от dedoc авторитетны, и жёсткие правила только мешают:
+        # они подняли бы нумерованный пункт «1 ПОДГОТОВЛЕН ...» (это
+        # <item>, то есть абзац) до заголовка. У .txt разметки нет —
+        # там заголовки распознаёт header_promoter.
+        # Важно: смотрим на ИСХОДНОЕ расширение. Маршрут .md/.xml/.txt
+        # отдаёт в dedoc временный .html, но авторитетность разметки
+        # определяется форматом исходника.
+        full_root = promote_headers(
+            full_root,
+            promote_non_headers=extension not in MARKUP_AUTHORITATIVE_EXTENSIONS,
+        )
         # Привязка таблиц СТРОГО после промоции: якорь с таблицей-ребёнком
         # шёл бы composite-путём без резки строк (см. reattach_tables).
+        # Таблицы без аннотаций (xlsx/csv) остаются orphan; для HTML-маршрута
+        # позиция восстанавливается по маркерам.
         reattach_tables(full_root, tables)
+        if html_tables:
+            from rag_parser.parsers.dedoc_tree import attach_tables_by_position
+
+            attach_tables_by_position(full_root, html_tables)
         markdown = full_tree_to_markdown(full_root)
 
         if not markdown.strip():
@@ -527,14 +649,11 @@ class DedocParser(BaseParser):
         self, document_id: str, tree: Dict[str, Any], markdown: str
     ) -> Dict[str, Path]:
         """Пишет сырой JSON dedoc и Markdown-рендер на диск."""
-        from rag_parser.core.config import settings
 
         output_dir = settings.ensure_dedoc_output_dir()
         tree_path = output_dir / f"{TREE_FILE_PREFIX}_{document_id}.json"
         markdown_path = output_dir / f"{MARKDOWN_FILE_PREFIX}_{document_id}.md"
-        tree_path.write_bytes(
-            orjson.dumps(tree, option=orjson.OPT_INDENT_2) + b"\n"
-        )
+        tree_path.write_bytes(orjson.dumps(tree, option=orjson.OPT_INDENT_2) + b"\n")
         markdown_path.write_bytes(markdown.encode("utf-8"))
         return {
             "output_dir": output_dir,

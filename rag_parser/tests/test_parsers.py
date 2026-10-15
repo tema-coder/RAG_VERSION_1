@@ -177,15 +177,21 @@ class TestParseFormats:
         result = parser.parse(pdf_files["pdf_text"])
         assert "First page of the document." in result.markdown
 
-    def test_header_threshold_flows(self, header_docs, tmp_path, monkeypatch):
+    def test_header_recognition_is_deterministic(
+        self, header_docs, tmp_path, monkeypatch
+    ):
+        """Нет порога: результат распознавания заголовков стабилен."""
         monkeypatch.setattr(
             settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
         )
         from rag_parser.parsers.dedoc_tree import collect_headers
 
-        low = DedocParser(header_threshold=0.0).parse(header_docs["unstyled"])
-        high = DedocParser(header_threshold=8.0).parse(header_docs["unstyled"])
-        assert len(collect_headers(low.tree)) > len(collect_headers(high.tree))
+        first = DedocParser().parse(header_docs["unstyled"])
+        second = DedocParser().parse(header_docs["unstyled"])
+        assert [h.text for h in collect_headers(first.tree)] == [
+            h.text for h in collect_headers(second.tree)
+        ]
+        assert collect_headers(first.tree), "хотя бы один заголовок должен найден"
 
 
 class TestTree:
@@ -344,19 +350,29 @@ class TestNewFormats:
         assert result == reference
 
     def test_markdown_alias_copied_to_txt(self, parser, monkeypatch, tmp_path):
-        """.md копируется в .txt: dedoc не читает markdown нативно."""
+        """.md больше не идёт в .txt: конвертируется в HTML (mistune).
+
+        Исторически .md копировался в .txt и уходил в RawTextReader, откуда
+        # и «# Заголовок», и pipe-таблица приходили обычным текстом (все
+        чанки с одним parent_id). Теперь markdown -> HTML -> HtmlReader.
+        """
         from rag_parser.parsers.dedoc_parser import prepare_for_parsing
 
         source = self._require("gost_report.md")
-        aliased, extension, temporary = prepare_for_parsing(source)
+        prepared = prepare_for_parsing(source)
         try:
-            assert extension == ".txt"
-            assert temporary is not None and temporary.exists()
-            assert temporary.suffix == ".txt"
-            assert aliased.read_bytes() == source.read_bytes()
+            assert prepared.extension == ".html"
+            assert prepared.temp_path is not None and prepared.temp_path.exists()
+            assert prepared.temp_path.suffix == ".html"
+            # таблицы извлечены нами и пойдут по маркерному маршруту
+            assert len(prepared.html_tables) == 9
+
+            html = prepared.temp_path.read_text(encoding="utf-8")
+            assert "<h1>" in html and "<table>" not in html
+            assert "__RAGTABLE_0__" in html
         finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            if prepared.temp_path is not None:
+                prepared.temp_path.unlink(missing_ok=True)
 
     def test_markdown_parses(self, parser):
         result = parser.parse(self._require("gost_report.md"))

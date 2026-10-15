@@ -360,3 +360,93 @@ class TestObjectShapes:
                                           "line_type": "header"}}}
         )
         assert paragraph_type == "header"
+
+
+class TestTableUidCollision:
+    """Обход бага dedoc 2.8: uid таблицы = md5(xml) без дедупликации.
+
+    Одинаковые таблицы получают одинаковый uid. При хранении
+    ``dict[uid] -> узел`` они схлопывались, и привязать удавалась только
+    первая — остальные уходили в orphan. Теперь на каждый uid хранится
+    очередь, и на каждую встреченную аннотацию берётся ровно одна таблица.
+    """
+
+    def _doc_with_repeated_anchors(self, count):
+        """Три абзаца-якоря с ОДНИМ И ТЕМ ЖЕ uid таблицы."""
+        def anchor(index):
+            # Список аннотаций нужен СВОЙ на каждый узел: build_full_tree
+            # дополняет его, и общий список дал бы всем узлам лишние якоря.
+            annotations = [
+                {"name": "table", "start": 0, "end": 5, "value": "same-uid"}
+            ]
+            return _struct_node(f"Раздел {index}", annotations=annotations)
+
+        return {
+            "text": "", "metadata": {"paragraph_type": "root"},
+            "annotations": [], "subparagraphs": [anchor(i) for i in range(count)],
+        }
+
+    def test_identical_tables_all_attached(self):
+        """Три одинаковые таблицы -> три якоря, ноль orphan."""
+        root = build_full_tree(
+            self._doc_with_repeated_anchors(3),
+            [_api_table("same-uid", [["A", "B"], ["1", "2"]]) for _ in range(3)],
+        )
+        assert root.metadata["orphan_tables"] == 0
+        anchored = [n for n in root.children if n.children
+                    and n.children[0].type == "table"]
+        assert len(anchored) == 3
+
+    def test_one_table_per_anchor_not_all_to_first(self):
+        """Регрессия: нельзя повесить ВСЕ таблицы на ПЕРВЫЙ якорь."""
+        root = build_full_tree(
+            self._doc_with_repeated_anchors(3),
+            [_api_table("same-uid", [["A", "B"], ["1", "2"]]) for _ in range(3)],
+        )
+        table_counters = [
+            sum(1 for c in n.children if c.type == "table") for n in root.children
+        ]
+        assert table_counters == [1, 1, 1], (
+            f"каждая таблица должна попасть в свой якорь, получено {table_counters}"
+        )
+
+    def test_more_tables_than_anchors(self):
+        """Лишние таблицы (без аннотаций) становятся orphan, не теряются."""
+        root = build_full_tree(
+            self._doc_with_repeated_anchors(2),
+            [_api_table("same-uid", [["A"], ["1"]]) for _ in range(4)],
+        )
+        assert root.metadata["orphan_tables"] == 2
+        tables = [n for n in root.children if n.type == "table"]
+        assert len(tables) == 2
+
+    def test_more_anchors_than_tables(self):
+        """Лишние аннотации не создают пустых таблиц."""
+        root = build_full_tree(
+            self._doc_with_repeated_anchors(4),
+            [_api_table("same-uid", [["A"], ["1"]]) for _ in range(2)],
+        )
+        assert root.metadata["orphan_tables"] == 0
+        assert sum(1 for n in root.children if n.type == "table") == 0
+        anchored = [n for n in root.children if n.children]
+        assert len(anchored) == 2
+
+    def test_table_order_preserved_for_duplicates(self):
+        """Очередь FIFO: таблицы попадают в якоря в порядке документа."""
+        root = build_full_tree(
+            self._doc_with_repeated_anchors(3),
+            [
+                _api_table("same-uid", [["H"], [f"row-{i}"]])
+                for i in range(3)
+            ],
+        )
+        texts = []
+        for node in root.children:
+            for child in node.children:
+                if child.type == "table":
+                    texts.append(child.text)
+        assert texts == [
+            "| H |\n|---|\n| row-0 |",
+            "| H |\n|---|\n| row-1 |",
+            "| H |\n|---|\n| row-2 |",
+        ]

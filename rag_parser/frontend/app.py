@@ -10,7 +10,7 @@ if __package__ in (None, ""):
 
 from rag_parser.api.dependencies import get_chunker, get_parser
 from rag_parser.api.schemas import ChunkingType
-from rag_parser.core.config import settings
+from rag_parser.core.config import DEFAULT_SUPPORTED_EXTENSIONS, settings
 from rag_parser.core.interfaces import DocumentError
 
 CHUNKING_LABELS = {
@@ -21,7 +21,28 @@ CHUNKING_LABELS = {
     "Рекурсивный": ChunkingType.RECURSIVE,
 }
 
-ACCEPTED_TYPES = ["docx", "xlsx", "xls", "pdf", "html", "htm", "txt", "csv", "tsv"]
+#: Расширения для ``st.file_uploader(type=...)``.
+#:
+#: Streamlit ждёт именно РАСШИРЕНИЯ без точки (не MIME-типы): в type=
+#: подставляется то, что показывается в диалоге выбора файлов и в
+#: подсказке загрузчика.
+#:
+#: Список берётся из ``core.config.DEFAULT_SUPPORTED_EXTENSIONS``, а не
+#: дублируется вручную. Хардкод раньше содержал 9 форматов и разошёлся с
+#: бэкендом: UI отбрасывал .doc/.odt/.rtf/.xml/.md, хотя парсер их читает.
+#: Теперь источник истины один — SUPPORTED_EXTENSIONS.
+ACCEPTED_TYPES = [ext.lstrip(".").lower() for ext in DEFAULT_SUPPORTED_EXTENSIONS]
+
+#: Подсказка под загрузчиком. Собирается из того же списка, чтобы текст и
+#: фильтр всегда совпадали.
+_FORMATS_HELP = ", ".join(
+    ext.lstrip(".").lower() for ext in DEFAULT_SUPPORTED_EXTENSIONS
+)
+ACCEPTED_HELP = (
+    f"Поддерживается {len(ACCEPTED_TYPES)} форматов: {_FORMATS_HELP}. "
+    "PDF — только текстовый слой, сканы будут отклонены (422, OCR отключён). "
+    "Для doc/odt/rtf требуется системный LibreOffice."
+)
 
 
 def process(
@@ -30,7 +51,6 @@ def process(
     chunk_size: int,
     overlap: int,
     threshold: float = 0.5,
-    header_threshold: float = 4.0,
 ) -> dict:
     from rag_parser.chunkers.hybrid import HybridRagChunker
     from rag_parser.parsers.dedoc_tree import truncate
@@ -40,9 +60,7 @@ def process(
         handle.write(upload.getbuffer())
         temp_path = Path(handle.name)
     try:
-        result = get_parser(upload.name, header_threshold=header_threshold).parse(
-            temp_path
-        )
+        result = get_parser(upload.name).parse(temp_path)
         result.filename = upload.name
         chunks = None
         chunker = get_chunker(
@@ -93,17 +111,37 @@ def render_metadata(metadata: dict) -> None:
 
 
 def render_tree_node(node: dict, depth: int = 0) -> None:
+    """Рендерит узел дерева через отступы вместо вложенных экспандеров.
+
+    Это предотвращает StreamlitAPIException: Expanders may not be nested.
+    """
     node_type = node.get("type", "?")
     level = node.get("level", 0)
     text = node.get("text", "")
     children = node.get("children", [])
-    label = f"{node_type} · level {level} · {text}"
-    if children:
-        with st.expander(label, expanded=(depth == 0)):
-            for child in children:
-                render_tree_node(child, depth + 1)
-    else:
-        st.write(label)
+
+    # Визуальный отступ для имитации иерархии
+    indent = "  " * depth
+
+    # Иконки для быстрой визуальной навигации
+    icons = {
+        "header": "📌",
+        "table": "📊",
+        "paragraph": "📝",
+        "list_item": "🔹",
+        "raw_text": "📄",
+        "document": "📁",
+    }
+    icon = icons.get(node_type, "⚪")
+
+    label = f"{indent}{icon} {node_type} · level {level} · {text}"
+
+    # Используем monospace для чёткого выравнивания отступов
+    st.markdown(f"`{label}`")
+
+    # Рекурсивно рендерим детей с увеличенным отступом
+    for child in children:
+        render_tree_node(child, depth + 1)
 
 
 def main() -> None:
@@ -113,11 +151,7 @@ def main() -> None:
     uploaded = st.file_uploader(
         "Загрузите документ",
         type=ACCEPTED_TYPES,
-        help=(
-            "Поддерживаются: docx, doc, odt, rtf, xlsx, xls, csv, tsv, "
-            "pdf (только текстовый слой), html, htm, txt, xml, md. "
-            "Для doc/odt/rtf требуется LibreOffice."
-        ),
+        help=ACCEPTED_HELP,
     )
 
     chunking_label = st.selectbox("Тип чанкинга", list(CHUNKING_LABELS.keys()))
@@ -126,33 +160,20 @@ def main() -> None:
     threshold = st.slider(
         "threshold (semantic)", 0.05, 0.95, settings.SEMANTIC_THRESHOLD, 0.05
     )
-    # Слайдера размера табличного чанка нет намеренно: по ТЗ 3.3 табличный
-    # чанк всегда содержит ровно одну строку данных.
-    header_threshold = st.slider(
-        "Порог распознавания заголовков",
-        0.0,
-        8.0,
-        float(settings.HEADER_PROMOTION_THRESHOLD),
-        0.5,
-    )
+    # Слайдеров размера табличного чанка и порога заголовков нет намеренно:
+    # табличный чанк всегда содержит ровно одну строку данных (ТЗ 3.3), а
+    # распознавание заголовков детерминированное (7 жёстких правил) и
+    # настраивается правкой parsers/header_promoter.py, а не вслепую.
 
     if overlap >= chunk_size:
         st.error("overlap должен быть меньше chunk_size")
         return
 
-    col_parse, col_reparse = st.columns(2)
-    with col_parse:
-        parse_clicked = st.button(
-            "Обработать документ", type="primary", disabled=uploaded is None
-        )
-    with col_reparse:
-        reparse_clicked = st.button(
-            "Перепарсить",
-            disabled=uploaded is None or "result" not in st.session_state,
-            help="Повторный запрос с новым порогом заголовков без перезагрузки файла",
-        )
+    parse_clicked = st.button(
+        "Обработать документ", type="primary", disabled=uploaded is None
+    )
 
-    if parse_clicked or reparse_clicked:
+    if parse_clicked:
         try:
             with st.spinner("Обработка документа..."):
                 st.session_state["result"] = process(
@@ -161,7 +182,6 @@ def main() -> None:
                     chunk_size,
                     overlap,
                     threshold,
-                    header_threshold,
                 )
         except DocumentError as exc:
             st.error(f"Ошибка обработки: {exc.message}")

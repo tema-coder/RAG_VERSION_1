@@ -49,18 +49,16 @@ def _chunking_params(
     chunk_size: Optional[int],
     overlap: Optional[int],
     threshold: Optional[float],
-    header_threshold: Optional[float],
 ) -> dict:
-    """Resolves and validates the chunking/header parameters of /api/parse.
+    """Resolves and validates the chunking parameters of /api/parse.
 
-    ``table_chunk_size`` здесь нет намеренно: по ТЗ 3.3 табличный чанк
-    всегда содержит ровно одну строку данных, параметра у него нет.
+    Параметров заголовков здесь нет намеренно: с версии 2.1 распознавание
+    заголовков детерминированное (7 жёстких правил в
+    ``parsers.header_promoter``), настраивать его порогом нельзя и не нужно.
     """
     chunk_size = settings.DEFAULT_CHUNK_SIZE if chunk_size is None else chunk_size
     overlap = settings.DEFAULT_OVERLAP if overlap is None else overlap
     threshold = settings.SEMANTIC_THRESHOLD if threshold is None else threshold
-    if header_threshold is None:
-        header_threshold = settings.HEADER_PROMOTION_THRESHOLD
 
     if overlap >= chunk_size:
         raise _error(400, "overlap must be smaller than chunk_size", "invalid_params")
@@ -74,15 +72,10 @@ def _chunking_params(
         raise _error(
             400, "threshold must be strictly between 0 and 1", "invalid_params"
         )
-    if not 0.0 <= header_threshold <= 8.0:
-        raise _error(
-            400, "header_threshold must be between 0 and 8", "invalid_params"
-        )
     return {
         "chunk_size": chunk_size,
         "overlap": overlap,
         "threshold": threshold,
-        "header_threshold": header_threshold,
     }
 
 
@@ -151,16 +144,14 @@ async def parse_document(
     chunk_size: Optional[int] = Form(None),
     overlap: Optional[int] = Form(None),
     threshold: Optional[float] = Form(None),
-    header_threshold: Optional[float] = Form(None),
 ) -> ParseResponse:
     started = time.perf_counter()
     filename = file.filename or ""
 
-    chunking = _chunking_params(chunk_size, overlap, threshold, header_threshold)
+    chunking = _chunking_params(chunk_size, overlap, threshold)
     chunk_size = chunking["chunk_size"]
     overlap = chunking["overlap"]
     threshold = chunking["threshold"]
-    header_threshold = chunking["header_threshold"]
 
     data = await file.read()
     if len(data) > settings.max_file_size_bytes:
@@ -172,7 +163,7 @@ async def parse_document(
 
     try:
         validate_upload(filename, data)
-        parser = get_parser(filename, header_threshold=header_threshold)
+        parser = get_parser(filename)
     except UnsupportedFormatError as exc:
         raise _error(422, exc.message, "unsupported_format") from exc
     except FileTooLargeError as exc:

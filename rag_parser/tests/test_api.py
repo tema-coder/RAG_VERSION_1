@@ -244,14 +244,29 @@ class TestParse:
             assert "2.1" in chunk["breadcrumb"]
             assert "|" not in chunk["text_for_embedding"]
 
-    def test_header_threshold_changes_tree(self, client, header_docs):
-        files_low, data_low = upload(header_docs["unstyled"], header_threshold="0.0")
-        files_high, data_high = upload(header_docs["unstyled"], header_threshold="8.0")
-        low = client.post("/api/parse", files=files_low, data=data_low).json()
-        high = client.post("/api/parse", files=files_high, data=data_high).json()
-        low_headers = [n for n in _walk_tree(low["tree"]) if n["type"] == "header"]
-        high_headers = [n for n in _walk_tree(high["tree"]) if n["type"] == "header"]
-        assert len(low_headers) > len(high_headers)
+    def test_header_recognition_is_deterministic(self, client, header_docs):
+        """Порога нет: два разбора одного файла дают одинаковое дерево.
+
+        Раньше здесь сравнивались пороги 0.0 и 8.0; теперь классификация
+        детерминированная (7 жёстких правил), поэтому проверяем, что
+        повторный разбор не меняет результат.
+        """
+        files_1, data_1 = upload(header_docs["unstyled"])
+        files_2, data_2 = upload(header_docs["unstyled"])
+        first = client.post("/api/parse", files=files_1, data=data_1).json()
+        second = client.post("/api/parse", files=files_2, data=data_2).json()
+        assert first["markdown"] == second["markdown"]
+        assert [n["text"] for n in _walk_tree(first["tree"])] == [
+            n["text"] for n in _walk_tree(second["tree"])
+        ]
+
+    def test_header_threshold_parameter_ignored(self, client, header_docs):
+        """Переданный header_threshold не ломает запрос и игнорируется."""
+        files_with, data_with = upload(header_docs["unstyled"], header_threshold="8.0")
+        files_without, data_without = upload(header_docs["unstyled"])
+        with_param = client.post("/api/parse", files=files_with, data=data_with).json()
+        plain = client.post("/api/parse", files=files_without, data=data_without).json()
+        assert with_param["markdown"] == plain["markdown"]
 
     def test_table_chunks_carry_text_for_embedding(self, client, xlsx_files):
         files, data = upload(
@@ -345,8 +360,6 @@ class TestParseErrors:
             {"chunking_type": "unknown"},
             {"threshold": "0"},
             {"threshold": "1.5"},
-            {"header_threshold": "-1"},
-            {"header_threshold": "9"},
         ],
     )
     def test_invalid_chunk_parameters(self, client, text_files, params):
@@ -501,12 +514,13 @@ class TestDependenciesUnit:
         with pytest.raises(UnsupportedFormatError):
             get_parser("file.pptx")
 
-    def test_get_parser_header_threshold(self):
-        assert get_parser("a.docx", header_threshold=2.0).header_threshold == 2.0
-        assert (
-            get_parser("a.docx").header_threshold
-            == settings.HEADER_PROMOTION_THRESHOLD
-        )
+    def test_get_parser_has_no_threshold(self):
+        """Порога заголовков больше нет: get_parser(filename) — без параметров."""
+        import inspect
+
+        params = inspect.signature(get_parser).parameters
+        assert list(params) == ["filename"]
+        assert isinstance(get_parser("a.docx"), DedocParser)
 
     def test_get_chunker_none(self):
         assert get_chunker(ChunkingType.NONE) is None
@@ -717,3 +731,62 @@ class TestPdfWithoutTextLayer:
         files, data = upload(pdf_files["pdf_scan"])
         response = client.post("/api/parse", files=files, data=data)
         assert response.headers.get("X-Error-Type") != "parse_error"
+
+
+class TestFrontendAcceptedTypes:
+    """Загрузчик UI не должен расходиться с бэкендом по списку форматов.
+
+    Регрессия: в app.py был захардкожен список из 9 расширений, из-за чего
+    Streamlit отбрасывал .doc/.odt/.rtf/.xml/.md, хотя парсер их читает.
+    """
+
+    def test_accepts_all_supported_extensions(self):
+        from rag_parser.core.config import DEFAULT_SUPPORTED_EXTENSIONS
+        from rag_parser.frontend.app import ACCEPTED_TYPES
+
+        assert ACCEPTED_TYPES == [
+            ext.lstrip(".").lower() for ext in DEFAULT_SUPPORTED_EXTENSIONS
+        ]
+
+    def test_accepts_the_five_new_formats(self):
+        from rag_parser.frontend.app import ACCEPTED_TYPES
+
+        for extension in ("doc", "odt", "rtf", "xml", "md"):
+            assert extension in ACCEPTED_TYPES, f"{extension} отвергается UI"
+
+    def test_streamlit_receives_extensions_without_dots(self):
+        """Streamlit ждёт расширения БЕЗ точки, а не MIME-типы."""
+        from rag_parser.frontend.app import ACCEPTED_TYPES
+
+        assert all("." not in item for item in ACCEPTED_TYPES)
+        assert all("/" not in item for item in ACCEPTED_TYPES)
+        assert len(ACCEPTED_TYPES) == 14
+
+    def test_unsupported_extensions_absent(self):
+        from rag_parser.frontend.app import ACCEPTED_TYPES
+
+        for extension in ("pptx", "exe", "epub", "zip"):
+            assert extension not in ACCEPTED_TYPES
+
+    def test_help_text_mentions_every_format(self):
+        from rag_parser.frontend.app import ACCEPTED_HELP, ACCEPTED_TYPES
+
+        for extension in ACCEPTED_TYPES:
+            assert extension in ACCEPTED_HELP, f"{extension} не упомянут в help"
+        assert "14" in ACCEPTED_HELP
+
+    def test_no_hardcoded_list_in_app_source(self):
+        """Список не должен дублироваться литералом в коде UI."""
+        import inspect
+
+        from rag_parser.frontend import app as frontend
+
+        source = inspect.getsource(frontend)
+        assert "DEFAULT_SUPPORTED_EXTENSIONS" in source
+        assert 'ACCEPTED_TYPES = ["docx"' not in source
+
+    def test_formats_endpoint_matches_uploader(self):
+        from rag_parser.frontend.app import ACCEPTED_TYPES
+
+        api_extensions = [item.lstrip(".").lower() for item in supported_extensions()]
+        assert sorted(ACCEPTED_TYPES) == sorted(api_extensions)

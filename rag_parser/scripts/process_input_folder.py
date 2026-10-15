@@ -8,8 +8,8 @@
 * ``{stem}_chunks.json`` — чанки с ``breadcrumb``, ``parent_id``, ``chunk_order``;
 * ``{stem}_tree.json``  — структурное дерево документа.
 
-Настройки те же, что и у API: ``chunk_size``, ``overlap``, ``threshold``,
-``HEADER_PROMOTION_THRESHOLD`` читаются из ``core.config`` (или ``.env``).
+Настройки те же, что и у API: ``chunk_size``, ``overlap`` и ``threshold``
+читаются из ``core.config`` (или ``.env``).
 
 Запуск (из корня репозитория):
 
@@ -156,7 +156,6 @@ def _build_chunker(
     chunk_size: Optional[int],
     overlap: Optional[int],
     threshold: Optional[float],
-    header_threshold: Optional[float],
 ) -> HybridRagChunker:
     return HybridRagChunker(
         text_strategy=text_strategy,  # type: ignore[arg-type]
@@ -175,9 +174,12 @@ def run(
     chunk_size: Optional[int] = None,
     overlap: Optional[int] = None,
     threshold: Optional[float] = None,
-    header_threshold: Optional[float] = None,
+    header_threshold: Optional[float] = None,  # noqa: ARG001 - DEPRECATED
 ) -> Dict[str, object]:
     """Обрабатывает папку целиком. Ошибка файла не прерывает цикл.
+
+    :param header_threshold: **устаревший**, игнорируется: распознавание
+        заголовков детерминированное, порога у него нет.
 
     :return: ``{"processed", "failed", "total", "artifacts", "errors"}``
     """
@@ -199,9 +201,9 @@ def run(
         logger.warning("no_supported_files", input=str(input_dir))
         return {"processed": 0, "failed": 0, "total": 0, "artifacts": {}, "errors": []}
 
-    parser = DedocParser(header_threshold=header_threshold)
+    parser = DedocParser()
     chunker = (
-        _build_chunker(text_strategy, chunk_size, overlap, threshold, header_threshold)
+        _build_chunker(text_strategy, chunk_size, overlap, threshold)
         if chunking
         else None
     )
@@ -271,7 +273,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     defaults.add_argument("--chunk-size", type=int, default=None)
     defaults.add_argument("--overlap", type=int, default=None)
     defaults.add_argument("--threshold", type=float, default=None)
-    defaults.add_argument("--header-threshold", type=float, default=None)
     defaults.add_argument("--log-level", default=None)
 
     args = defaults.parse_args(argv)
@@ -287,7 +288,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         chunk_size=args.chunk_size,
         overlap=args.overlap,
         threshold=args.threshold,
-        header_threshold=args.header_threshold,
     )
 
     print(

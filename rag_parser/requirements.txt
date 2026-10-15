@@ -1,49 +1,25 @@
-# Верхнеуровневые зависимости rag_parser.
-#
-# Версии здесь — МЯГКИЕ диапазоны. Точное рабочее окружение зафиксировано
-# в ../constraints.txt и устанавливается ВМЕСТЕ с этим файлом:
-#
-#     pip install --no-deps "dedoc==2.8"
-#     pip install -r rag_parser/requirements.txt -c constraints.txt
-#
-# Порядок важен: dedoc ставится ПЕРВЫМ и БЕЗ зависимостей, остальное — вторым.
-#
-# Почему такой порядок: dedoc 2.8 — пакет 2023 года с жёсткими пинами
-# (starlette<=0.27.0, scipy<=1.11.2, python-docx==0.8.11), несовместимые
-# с современными FastAPI/Streamlit. Если поставить его обычным резолвером,
-# pip завершается ResolutionImpossible. Мы импортируем только DedocManager;
-# затрагиваемые его пинами модули (dedoc.api, OCR-ридеры) сервис не грузит.
-# Подробности — в constraints.txt и README, раздел «Отклонения от ТЗ».
-
-# --- Парсинг -------------------------------------------------------------
-pdf2image>=1.10            # рендер страниц PDF, используется dedoc
-openpyxl>=3.1              # чтение merged-диапазонов .xlsx (forward-fill)
-
-# --- API -----------------------------------------------------------------
-fastapi>=0.104
-uvicorn[standard]>=0.23
-python-multipart>=0.0.6   # dedoc требует ровно 0.0.6 — версию ставит constraints
+dedoc==2.8
+streamlit==1.38.0
+fastapi==0.104.1
+uvicorn[standard]==0.23.2
+python-multipart==0.0.6
 pydantic>=2.5.3,<3
 pydantic-settings>=2.0
-orjson>=3.10
-aiofiles>=24.1
-python-magic>=0.4.27      # libmagic: проверка mime загруженного файла
-python-dotenv>=1.0.1
-structlog>=24.4.0
-
-# --- Чанкинг -------------------------------------------------------------
-chonkie>=1.3
-tiktoken>=0.7
-sentence-transformers>=3.0 # эмбеддинги для semantic-чанкера (CPU)
-tqdm>=4.66                 # прогресс пакетной обработки папки
-
-# --- UI ------------------------------------------------------------------
-streamlit>=1.38
-
-# --- Тесты и фикстуры ----------------------------------------------------
-httpx>=0.27.2              # HTTP-клиент в тестах
-pytest>=8.3
-pytest-asyncio>=0.24
-pytest-cov
-python-docx==0.8.11        # генерация .docx-фикстур; версия зафиксирована dedoc
-xlwt>=1.3                  # генерация .xls-фикстур
+tiktoken==0.7.0
+chonkie==1.3.1
+sentence-transformers>=3.0
+tqdm 
+aiofiles==24.1.0
+httpx==0.27.2
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov 
+structlog==24.4.0
+python-dotenv==1.0.1
+python-magic==0.4.27
+orjson==3.10.7
+openpyxl 
+python-docx==0.8.11
+xlwt
+pdf2docx==0.5.13
+mistune==3.1.3

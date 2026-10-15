@@ -41,12 +41,16 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     DOC_STORE_MAX_ITEMS: int = 64
     SUPPORTED_EXTENSIONS: List[str] = DEFAULT_SUPPORTED_EXTENSIONS
-    HEADER_PROMOTION_THRESHOLD: float = 4.0
     # ТЗ 3.2: в крошку входят максимум ДВА последних уровня заголовков.
     # Например 1.1 -> 1.1.1 -> 1.1.1.1 даёт "1.1.1 Название > 1.1.1.1 Название".
     # 0 или меньше отключает ограничение (весь путь) — для отладки.
     BREADCRUMB_MAX_DEPTH: int = 2
     TREE_TEXT_PREVIEW_LEN: int = 30
+    # PDF → DOCX через pdf2docx перед разбором. ВЫКЛЮЧЕНО по умолчанию:
+    # конвертер теряет большую часть текста (в замере 66 текстовых блоков
+    # превращаются в 24), добавляет лишнюю таблицу и привязывает таблицы
+    # к чужим разделам. Подробности — README, «Ограничения PDF».
+    PDF_VIA_DOCX: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",

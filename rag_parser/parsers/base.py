@@ -14,7 +14,9 @@ def read_bytes(file_path: Path) -> bytes:
     try:
         return path.read_bytes()
     except OSError as exc:
-        raise DocumentParseError(f"Cannot read file: {exc}", filename=path.name) from exc
+        raise DocumentParseError(
+            f"Cannot read file: {exc}", filename=path.name
+        ) from exc
 
 
 def decode_text(data: bytes) -> tuple:
