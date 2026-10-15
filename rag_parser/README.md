@@ -117,7 +117,7 @@ Swagger UI: <http://localhost:8000/docs>.
 ## Запуск UI
 
 ```bash
-streamlit run rag_parser/frontend/app.py
+streamlit run frontend/app.py
 ```
 
 UI работает без запущенного API: парсер и чанкеры вызываются напрямую.
