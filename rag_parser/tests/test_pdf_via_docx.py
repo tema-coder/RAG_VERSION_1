@@ -1,8 +1,9 @@
-"""Тесты опционального маршрута PDF → DOCX (parsers/pdf_via_docx).
+"""Тесты маршрута PDF → DOCX (parsers/pdf_via_docx).
 
 Сам конвертёр не проверяем — он внешний. Проверяем маршрутизацию: флаг
-выключен по умолчанию, при включении файл реально идёт через DOCX, а
-временный файл удаляется.
+включён по умолчанию, файл реально идёт через DOCX, временный файл
+удаляется, а артефакты конвертации (таблица из одной строки шапки) не
+попадают в итоговое дерево.
 """
 
 from pathlib import Path
@@ -64,10 +65,12 @@ class TestParserRouting:
         monkeypatch.setattr(module, "prepare_manager_for_format", spy)
         return seen
 
-    def test_flag_is_off_by_default(self):
+    def test_flag_is_on_by_default(self):
+        """Эталон (раздел 4.2 спеки): по умолчанию PDF идёт через
+        pdf2docx → DocxReader, а не через нативный PdfTxtlayerReader."""
         from rag_parser.core.config import Settings
 
-        assert Settings().PDF_VIA_DOCX is False
+        assert Settings().PDF_VIA_DOCX is True
 
     def test_native_pdf_route_used_when_flag_off(self, monkeypatch):
         import rag_parser.parsers.dedoc_parser as module
@@ -105,25 +108,22 @@ class TestParserRouting:
         assert not list(tmp_path.glob("*_via_pdf2docx.docx"))
 
 class TestPdfViaDocxMeasuredReality:
-    """Проблема 3: критерий «9 таблиц, 0 orphan» измерением НЕ подтверждается.
+    """Проблема 3: конвертер ``pdf2docx`` работает приблизительно.
 
-    ТЗ предлагает проверять, что маршрут даёт 9 таблиц без orphan. Замер
-    (``scripts/debug_pdf_via_docx.py``) говорит обратное:
+    Замер (тесты ниже + ``scripts/compare_all_formats.py``)::
 
-    ==========================  =========  =========
-    показатель                  DOCX       DOCX из PDF
-    ==========================  =========  =========
-    текстовых блоков            66         24   (-64%)
-    таблиц                     9          10   (+1 лишняя)
-    orphan                      0          1
-    ==========================  =========  =========
+        показатель         эталонный DOCX    PDF -> DOCX
+        заголовков                        42            37
+        таблиц                              9             9
+        orphan                              0             1
 
-    Конвертер ``pdf2docx`` восстанавливает таблицы приблизительно
-    (floating-блоки по эвристическим координатам) и теряет большую часть
-    текста, поэтому маршрут остаётся выключенным по умолчанию и описан
-    как ограничение (README, п. 6 Workarounds). Тесты ниже фиксируют
-    фактическое поведение, чтобы расхождение с критерием ТЗ было видно
-    в коде, а не только в переписке.
+    Часть текста теряется, слова склеиваются без пробелов, а таблица,
+    разорванная границей страницы, даёт хвост без строки шапки — он и
+    остаётся единственной orphan-таблицей. Куски из одной строки шапки
+    отбрасываются на входе (см. ``dedoc_tree.drop_header_only_tables``),
+    поэтому в дереве таблиц ровно столько же, сколько в эталоне.
+    Тесты фиксируют фактическое поведение, чтобы расхождение с критерием
+    ТЗ было видно в коде, а не только в переписке.
     """
 
     @pytest.mark.skipif(
@@ -146,7 +146,8 @@ class TestPdfViaDocxMeasuredReality:
         assert len(converted.markdown) < len(original.markdown)
 
     def test_converted_docx_has_extra_table(self, tmp_path):
-        """Конвертер добавляет лишнюю таблицу — их больше, чем в оригинале."""
+        """Сырой конвертер добавляет лишнюю таблицу — их больше, чем в
+        оригинале (её разбирает фильтр ниже)."""
         from rag_parser.parsers.dedoc_parser import DedocParser
         from rag_parser.parsers.pdf_via_docx import convert_pdf_to_docx
 
@@ -175,6 +176,47 @@ class TestPdfViaDocxMeasuredReality:
     @pytest.mark.skipif(
         not pdf2docx_available(), reason="pdf2docx не установлен"
     )
+    def test_pdf_route_drops_header_only_tables(self, monkeypatch, tmp_path):
+        """В дереве PDF столько же таблиц, сколько в эталонном DOCX.
+
+        Конвертер оставляет куски из одной строки шапки на месте стыка
+        страниц — это не таблицы документа, и ``drop_header_only_tables``
+        отбрасывает их до привязки.
+        """
+        from rag_parser.parsers import dedoc_parser as module
+        from rag_parser.parsers.dedoc_parser import DedocParser
+        from rag_parser.parsers.pdf_via_docx import convert_pdf_to_docx
+
+        def count_tables(tree):
+            found = 0
+            stack = [tree]
+            while stack:
+                node = stack.pop()
+                if node.type == "table":
+                    found += 1
+                stack.extend(node.children)
+            return found
+
+        pdf = INPUT / "gost_report.pdf"
+        docx = INPUT / "gost_report.docx"
+        if not pdf.exists() or not docx.exists():
+            pytest.skip("исходники отсутствуют в input/")
+
+        converted_path = convert_pdf_to_docx(pdf, tmp_path)
+        assert converted_path is not None
+        raw_tables = count_tables(DedocParser().parse(converted_path).tree)
+
+        monkeypatch.setattr(module.settings, "PDF_VIA_DOCX", True)
+        monkeypatch.setattr(module.settings, "TEMP_DIR", str(tmp_path), raising=False)
+        pdf_tables = count_tables(DedocParser().parse(pdf).tree)
+        docx_tables = count_tables(DedocParser().parse(docx).tree)
+
+        assert raw_tables > docx_tables, "сырой конвертер добавляет куски таблиц"
+        assert pdf_tables == docx_tables
+
+    @pytest.mark.skipif(
+        not pdf2docx_available(), reason="pdf2docx не установлен"
+    )
     def test_route_uses_docx_reader(self, monkeypatch, tmp_path):
         """Проверяем ровно то, что просит ТЗ: расширение меняется на .docx,
         и читает документ DocxReader, а не PdfTxtlayerReader."""
@@ -199,8 +241,9 @@ class TestPdfViaDocxMeasuredReality:
         assert ".docx" in seen
         assert ".pdf" not in seen
 
-    def test_native_pdf_is_the_default(self):
-        """Без флага идёт нативный PdfReader — он и даёт корректные таблицы."""
+    def test_pdf_via_docx_is_the_default(self):
+        """Эталон (раздел 4.2 спеки): по умолчанию идёт маршрут через
+        pdf2docx → DocxReader, а не нативный PdfTxtlayerReader."""
         import rag_parser.parsers.dedoc_parser as module
 
-        assert module.settings.PDF_VIA_DOCX is False
+        assert module.settings.PDF_VIA_DOCX is True

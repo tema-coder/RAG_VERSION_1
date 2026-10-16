@@ -24,6 +24,7 @@
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from rag_parser.core.interfaces import DocumentNode
@@ -402,6 +403,52 @@ def _table_node(md_table: str) -> DocumentNode:
     )
 
 
+#: Разделитель шапки в Markdown-таблице (``|---|---|``).
+_MARKDOWN_SEPARATOR_RE = re.compile(r"^\|[\s|:-]+\|$")
+
+
+def is_header_only_table(md_table: str) -> bool:
+    """Таблица без единой строки данных — обрывок, а не таблица.
+
+    ``pdf2docx`` (и не только он) дробит таблицу, «уехавшую» на границу
+    страницы: остаётся кусок из одной строки шапки, который dedoc видит как
+    самостоятельную таблицу. На ``gost_report.pdf`` это давало десятую
+    таблицу, которой нет в исходном документе (в эталонном DOCX их 9).
+
+    Применяется ТОЛЬКО к результатам конвертации (см. ``dedoc_parser``): в
+    авторском документе таблица из одной шапки — редкий, но законный случай,
+    и молча выбрасывать её нельзя.
+    """
+    lines = [line for line in (md_table or "").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return True
+    if not _MARKDOWN_SEPARATOR_RE.match(lines[1].strip()):
+        return False
+    return not any(
+        line.strip().startswith("|") and line.strip() != lines[1].strip()
+        for line in lines[2:]
+    )
+
+
+def drop_header_only_tables(tables: List[Any]) -> List[Any]:
+    """Выбрасывает из результата конвертации таблицы без строк данных.
+
+    :return: новый список таблиц; исходный не мутируется.
+    """
+    from rag_parser.parsers.base import rows_to_markdown_table
+
+    kept: List[Any] = []
+    for table in tables or []:
+        rows = table_to_rows(table)
+        if not rows:
+            continue
+        md_table, _, _ = rows_to_markdown_table(rows)
+        if is_header_only_table(md_table):
+            continue
+        kept.append(table)
+    return kept
+
+
 def _attach_tables(children: List[DocumentNode], tables: List[Any]) -> int:
     """Привязка таблиц к узлам-якорям по `TableAnnotation`.
 
@@ -482,6 +529,81 @@ def _attach_tables(children: List[DocumentNode], tables: List[Any]) -> int:
     return len(orphans)
 
 
+#: Якорь шкалы уровней: заголовок раздела верхнего уровня («1 Область
+#: применения») — ровно один номер без точек. Он задаёт, на каком уровне в
+#: этом файле начинается тело документа.
+LEVEL_ANCHOR_RE = re.compile(r"^\s*(\d+)\s+\S")
+
+
+def _numbering_anchor_level(headers: List[DocumentNode]) -> Optional[int]:
+    """Уровень, на котором в документе лежит большинство разделов «N Название».
+
+    Почему «большинство», а не «первый такой заголовок»: первым таким
+    заголовком почти всегда оказывается первый пункт предисловия
+    («1 ПОДГОТОВЛЕН …»), который в HTML-разметке поднят до ``<h1>`` и задал бы
+    сдвиг 0 — тело осталось бы на уровень глубже эталонного. Основная масса
+    нумерованных разделов («1 Область применения» … «8 Методы оценки»)
+    находится на одном уровне, и он-то и есть верхний уровень документа.
+    При равенстве счётчиков берём меньший уровень — он безопаснее.
+    """
+    counts: Dict[int, int] = {}
+    for node in headers:
+        if LEVEL_ANCHOR_RE.match(node.text or ""):
+            counts[node.level] = counts.get(node.level, 0) + 1
+    if not counts:
+        return None
+    return min(counts, key=lambda level: (-counts[level], level))
+
+
+def normalize_markup_levels(root: DocumentNode) -> int:
+    """Выравнивает уровни заголовков разметочных форматов по эталонной шкале.
+
+    Зачем
+    ----
+    В DOCX уровень приходит из стиля абзаца, и раздел «1 Область применения»
+    имеет уровень 1. В HTML/Markdown/XML автор обычно отводит под титул
+    ``<h1>``, а тело начинает с ``<h2>`` — там, где в эталоне первая строка
+    раздела, получается второй уровень, и все разделы уезжают на уровень ниже
+    (крошки в чанках при этом тоже не совпадают).
+
+    Сдвиг не «зашит», а берётся из самого документа: уровень, на котором
+    лежит большинство нумерованных разделов («1 Область применения» …
+    «8 Методы оценки»), и есть верхний уровень этого документа — например
+    ``<h2>`` в теле даёт сдвиг 1, а markdown, где тело начинается с ``#``,
+    даёт сдвиг 0. Так правило не зависит от того, с какой глубины автор
+    решил начать (см. ``_numbering_anchor_level``).
+
+    Применяется ТОЛЬКО к форматам с авторской разметкой (``.html``/``.htm``/
+    ``.md``/``.xml``) и только ДО ``promote_headers``: тот пересобирает
+    вложенность по уровням (``_rebuild``), и сдвиг после него уже ничего бы
+    не перестроил.
+
+    :return: число заголовков, у которых уровень изменился.
+    """
+    ordered: List[DocumentNode] = []
+
+    def collect(node: DocumentNode) -> None:
+        if node.type == "header":
+            ordered.append(node)
+        for child in node.children:
+            collect(child)
+
+    for child in root.children:
+        collect(child)
+
+    anchor_level = _numbering_anchor_level(ordered)
+    if not anchor_level or anchor_level <= 1:
+        # Якорь не найден или уже на первом уровне — сдвигать нечего.
+        return 0
+
+    changed = 0
+    for node in ordered:
+        if node.level >= anchor_level:
+            node.level -= anchor_level - 1
+            changed += 1
+    return changed
+
+
 def detach_tables(root: DocumentNode) -> None:
     """Убирает все узлы `type == "table"` из дерева (порядок остальных kept)."""
 
@@ -528,6 +650,8 @@ def attach_tables_by_position(
         root.metadata["orphan_tables"] = root.metadata.get("orphan_tables", 0)
         return int(root.metadata["orphan_tables"])
 
+    # Список НЕ фильтруем: индекс маркера __RAGTABLE_N__ совпадает с
+    # индексом в списке, сдвиг разорвал бы привязку позиций.
     attached, orphans = extract_and_attach_tables(root, markdown_tables)
     already = int(root.metadata.get("orphan_tables", 0) or 0)
     total = already + orphans

@@ -376,7 +376,11 @@ class TestHeaderLevelTracker:
             first.calculate_level(text)
         second = HeaderLevelTracker()
         assert second.level_stack == []
-        assert second.calculate_level("1.1.1.1 Глубоко") == 1
+        # Orphan numbering на свежем трекере: уровень по числу точек,
+        # ограниченный MAX_HEADER_LEVEL. Эталонный test_header_classification
+        # из раздела 7.4 спеки ожидает для «1.1.1.1» -> 3 (обрезка),
+        # а не 1. Прежнее поведение «orphan -> Level 1» противоречило спеке.
+        assert second.calculate_level("1.1.1.1 Глубоко") == 3
 
     def test_reset_clears_stack(self):
         tracker = HeaderLevelTracker()
@@ -505,7 +509,23 @@ class TestBoldFromDocxAnnotations:
         assert classify_header(text, whole)[0] is True
 
     def test_no_annotations_means_no_bold(self):
-        assert classify_header("Предисловие", [])[0] is False
+        """Без аннотаций DOCX жирного нет — обычный текст заголовком не станет.
+
+        В примере НЕ используются слова секций («Предисловие», «Введение»):
+        они распознаются по правилу 3 независимо от жирности, и такой пример
+        ничего не проверял бы.
+        """
+        assert classify_header("Обычный абзац текста", [])[0] is False
+
+    def test_preface_is_section_word(self):
+        """«Предисловие» — слово секции (правило 3), уровень 1.
+
+        В txt-версии ГОСТ «Предисловие» идёт обычной строкой без всякой
+        разметки; без этого слова оно оставалось абзацем, и все пункты
+        предисловия уезжали в чанки с крошкой предыдущего заголовка.
+        """
+        is_header, level = classify_header("Предисловие", [])
+        assert is_header is True and level == 1
 
     def test_bold_header_in_docx(self, tmp_path):
         """Сквозной тест на настоящем DOCX без стилей Heading."""
@@ -617,10 +637,28 @@ class TestTocSuppression:
 
 
 class TestMarkupFormatsKeepAuthoritativeLevels:
-    """Проблема 4: кап 3 уровней не должен просачиваться в разметочные форматы."""
+    """Проблема 4: кап 3 уровней не должен просачиваться в разметочные форматы.
 
-    def test_md_levels_match_headings(self):
-        """Уровни .md совпадают с глубиной ``#`` в исходнике."""
+    Уровни заголовков разметочных форматов задаёт сам документ, но шкала
+    приводится к эталонной: тело markdown/HTML обычно начинается на уровень
+    глубже титульного блока (``#`` — название документа, ``##`` — первый
+    раздел), а в эталонном дереве раздел «1 Область применения» — уровень 1
+    (см. ``dedoc_tree.normalize_markup_levels``).
+    """
+
+    @staticmethod
+    def _headers(tree):
+        found = []
+        stack = [tree]
+        while stack:
+            node = stack.pop(0)
+            if node.type == "header":
+                found.append(node)
+            stack = list(node.children) + stack
+        return found
+
+    def test_md_levels_follow_section_numbering(self):
+        """Уровень заголовка = глубина номера раздела (1 -> 1, 6.2.1 -> 3)."""
         import re
         from pathlib import Path
 
@@ -630,24 +668,33 @@ class TestMarkupFormatsKeepAuthoritativeLevels:
         if not source.exists():
             pytest.skip("файл отсутствует в input/")
 
-        depths = [
-            len(mark.group(1))
-            for line in source.read_text(encoding="utf-8").split("\n")
-            if (mark := re.match(r"^(#+) ", line))
-        ]
+        result = DedocParser().parse(source)
+        levels = {}
+        for header in self._headers(result.tree):
+            match = re.match(r"^(\d+(?:\.\d+)*)\s", header.text)
+            if match:
+                levels.setdefault(match.group(1), header.level)
+
+        assert levels["1"] == 1
+        assert levels["5"] == 1
+        assert levels["5.1"] == 2
+        assert levels["6.2"] == 2
+        assert levels["6.2.1"] == 3
+
+    def test_md_levels_are_capped_at_three(self):
+        """Кап 3 уровня: ``####`` в разметке не даёт уровень 4."""
+        from pathlib import Path
+
+        from rag_parser.parsers.dedoc_parser import DedocParser
+
+        source = Path(__file__).resolve().parent.parent.parent / "input" / "gost_report.md"
+        if not source.exists():
+            pytest.skip("файл отсутствует в input/")
 
         result = DedocParser().parse(source)
-        levels = []
-        stack = [result.tree]
-        while stack:
-            node = stack.pop(0)
-            if node.type == "header":
-                levels.append(node.level)
-            stack = list(node.children) + stack
-
-        assert len(levels) == len(depths)
-        assert sorted(levels) == sorted(depths)
-        assert max(levels) >= 4, "уровень 4 из h4 обязан сохраниться"
+        levels = {header.level for header in self._headers(result.tree)}
+        assert max(levels) == 3
+        assert {1, 2, 3} <= levels
 
 
 class TestTxtNesting:

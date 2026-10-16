@@ -50,6 +50,42 @@ _MD_SEPARATOR = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
 #: Строка-разделитель «гостовской» таблицы: сплошные дефисы.
 _ASCII_SEPARATOR = re.compile(r"^\s*-{3,}\s*$")
 
+#: Декоративная строка-разделитель: «==========», «--------------». Это
+#: оформление, а не текст: в эталонном дереве таких абзацев нет, и без
+#: фильтра каждая превращается в лишний чанк (в gost_report.txt их 21).
+_DECORATION_LINE = re.compile(r"^[-=_~*·.\s]{3,}$")
+
+#: Метка приложения («Приложение А (справочное)») — строка состоит ТОЛЬКО из
+#: метки. Строка оглавления «Приложение А (справочное) Пример использования
+#: … 34» под это не подпадает: там после метки идёт название и номер страницы.
+_APPENDIX_HEADER_RE = re.compile(r"^Приложение\s+[^\s(]+(?:\s*\([^)]*\))?$", re.IGNORECASE)
+
+#: Запись оглавления: номер страницы в конце строки («… 34»). Название
+#: приложения из оглавления заголовком быть не может.
+_TOC_ENTRY_RE = re.compile(r"…\s*\d+\s*$")
+
+#: Предельная длина названия приложения. Названия приложений короткие
+#: («Пример использования настоящего стандарта»), а за меткой приложения
+#: всегда идёт обычный текст — длиннее этой границы он не заголовок.
+_APPENDIX_TITLE_MAX_LEN = 120
+
+
+#: Пустая подпись таблицы («Таблица:» без номера и названия) прямо перед
+#: таблицей. В эталонном DOCX такой подписи нет вовсе, а из текста она
+#: попадала отдельным чанком-однострочником; содержания в ней нет, поэтому
+#: выбрасываем, а не тащим в чанки.
+_EMPTY_TABLE_CAPTION = re.compile(r"^Таблица\s*:\s*$", re.IGNORECASE)
+
+
+def _is_content_line(line: str) -> bool:
+    """Строка, из которой получается абзац: не пустая и не разделитель."""
+    stripped = (line or "").strip()
+    return bool(stripped) and not _DECORATION_LINE.match(stripped)
+
+
+def _is_empty_caption(line: str) -> bool:
+    return bool(_EMPTY_TABLE_CAPTION.match((line or "").strip()))
+
 def _is_pipe_row(line: str) -> bool:
     """Строка-таблица: хотя бы один ``|`` (двухколоночная таблица — это
     одна черта на строку) и строка не является разделителем."""
@@ -113,25 +149,73 @@ def _render_table(rows: List[List[str]]) -> str:
     return "".join(parts)
 
 
+def _blocks(lines: List[str]) -> List[Tuple[str, object]]:
+    """Разбирает строки на абзацы и таблицы: ``[(kind, payload), ...]``."""
+    items: List[Tuple[str, object]] = []
+    cursor = 0
+    for start, end, rows in find_table_blocks(lines):
+        index = cursor
+        while index < start:
+            line = lines[index]
+            if (
+                _is_empty_caption(line)
+                and not any(_is_content_line(between) for between in lines[index + 1 : start])
+            ):
+                # Подпись без номера и названия прямо перед таблицей.
+                index += 1
+                continue
+            if _is_content_line(line):
+                items.append(("p", line.strip()))
+            index += 1
+        items.append(("table", rows))
+        cursor = end
+    for line in lines[cursor:]:
+        if _is_content_line(line):
+            items.append(("p", line.strip()))
+    return items
+
+
+def _mark_appendix_titles(items: List[Tuple[str, object]]) -> List[Tuple[str, object]]:
+    """Метка приложения -> ``<h1>``, следующая за ней строка -> ``<h2>``.
+
+    В DOCX «Приложение А (справочное)» и «Пример использования настоящего
+    стандарта» — два заголовка (уровни 1 и 2). В простом тексте между ними
+    стоит линия-разделитель, и без этого правила название остаётся абзацем:
+    подраздел приложения теряется, а его чанки получают неверную крошку.
+
+    Обе строки размечаем явно: ``HtmlReader`` считает уровни от самой глубокой
+    встретившейся метки, поэтому один ``<h2>`` без ``<h1>`` дал бы уровень 1.
+    """
+    marked = list(items)
+    for index, (kind, payload) in enumerate(items[:-1]):
+        if kind != "p" or not isinstance(payload, str):
+            continue
+        if not _APPENDIX_HEADER_RE.match(payload):
+            continue
+        marked[index] = ("h1", payload)
+        next_kind, next_payload = marked[index + 1]
+        if next_kind != "p" or not isinstance(next_payload, str):
+            continue
+        if _TOC_ENTRY_RE.search(next_payload):
+            continue
+        if len(next_payload) <= _APPENDIX_TITLE_MAX_LEN:
+            marked[index + 1] = ("h2", next_payload)
+    return marked
+
+
 def text_to_html(text: str) -> str:
     """Оборачивает текст в HTML, заменяя найденные ASCII/Markdown-таблицы."""
     if not text or not text.strip():
         return "<html><body></body></html>"
 
-    lines = text.split("\n")
-    blocks = find_table_blocks(lines)
-
+    items = _mark_appendix_titles(_blocks(text.split("\n")))
     parts: List[str] = []
-    cursor = 0
-    for start, end, rows in blocks:
-        for line in lines[cursor:start]:
-            if line.strip():
-                parts.append(f"<p>{escape(line.strip())}</p>")
-        parts.append(_render_table(rows))
-        cursor = end
-    for line in lines[cursor:]:
-        if line.strip():
-            parts.append(f"<p>{escape(line.strip())}</p>")
+    for kind, payload in items:
+        if kind == "table":
+            parts.append(_render_table(payload))  # type: ignore[arg-type]
+        else:
+            tag = kind if kind in ("h1", "h2") else "p"
+            parts.append(f"<{tag}>{escape(str(payload))}</{tag}>")
 
     return "<html><body>" + "".join(parts) + "</body></html>"
 

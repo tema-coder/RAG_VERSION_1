@@ -40,6 +40,8 @@ Markdown), а в HTML остаётся только маркер-абзац:
 import re
 from typing import List, Sequence, Tuple
 
+from bs4 import BeautifulSoup, NavigableString
+
 from rag_parser.core.interfaces import DocumentNode
 
 #: Маркер позиции таблицы. Число — индекс таблицы в порядке документа.
@@ -49,6 +51,140 @@ MARKER_PREFIX = "__RAGTABLE_"
 
 #: Ограничение на размер ячейки при рендере таблицы в Markdown.
 MAX_CELL_LENGTH = 512
+
+# ---------------------------------------------------------------------------
+# Приведение авторской разметки к структуре ГОСТ
+# ---------------------------------------------------------------------------
+#: Классы титульного блока, которые в эталонном DOCX являются заголовками
+#: уровня 1. ``iso``/``edition``/``publisher`` в перечень НЕ входят: в DOCX это
+#: обычные абзацы, иначе дерево разъехалось бы с эталоном лишними разделами.
+TITLE_PAGE_HEADER_CLASSES = ("org", "country", "num")
+
+#: Заголовок, после которого идёт нумерованный список пунктов предисловия.
+PREFACE_WORDS = ("предисловие",)
+
+#: Строка классификации, которая в DOCX тоже заголовок («ОКС 35.240.99»).
+#: «УДК 004.9:006.354» в эталоне абзац, поэтому проверяем именно ОКС.
+CLASSIFICATION_RE = re.compile(r"^ОКС\s+[\d.]+", re.IGNORECASE)
+
+#: Нумерованный термин/подраздел: «3.1 синтетический документ: …». Требуем
+#: хотя бы одну точку, иначе под правило попал бы обычный абзац списка.
+DOTTED_NUMBER_RE = re.compile(r"^(\d+(?:\.\d+)+)\s+\S")
+
+#: Номер, который рендерер добавил в текст пункта списка («1. ПОДГОТОВЛЕН …»).
+#: В эталонном дереве номер без точки: «1 ПОДГОТОВЛЕН …».
+LIST_NUMBER_PREFIX_RE = re.compile(r"^\d+\s*[.)]\s*")
+
+#: Пункт списка, уже пронумерованный в самом тексте («[1] ISO/IEC …»).
+#: В DOCX это обычный абзац библиографии, поэтому оставляем его абзацем:
+#: иначе рендерер добавит вторую нумерацию («1. [1] ISO/IEC …»), которой нет
+#: в эталоне.
+BRACKETED_ITEM_RE = re.compile(r"^\[\d+\]")
+
+#: Теги жирного начертания: термин в ГОСТ набран полужирным в начале абзаца.
+BOLD_TAGS = ("b", "strong")
+
+_MAX_HEADING_LEVEL = 6
+
+
+def _text_of(node) -> str:
+    return " ".join(node.get_text(" ", strip=True).split())
+
+
+def _leading_bold(node):
+    """Первый значимый узел ``<p>``, если это ``<b>``/``<strong>``."""
+    for child in node.contents:
+        if isinstance(child, NavigableString) and not child.strip():
+            continue
+        return child if child.name in BOLD_TAGS else None
+    return None
+
+
+def promote_gost_structure(html_content: str) -> str:
+    """Проставляет заголовки там, где разметка источника их не выражает.
+
+    Зачем
+    ----
+    В DOCX заголовками являются титульные строки, пункты предисловия и
+    термины — там их видно по стилю абзаца. В HTML/Markdown то же содержание
+    лежит обычными абзацами (``<p class='org'>``, ``<li>`` предисловия,
+    ``<b>3.1 …</b>``), и без разметки эти строки уезжают в чанки как обычный
+    текст: ``parent_id`` у всех один, структура документа теряется.
+
+    Что делаем (правила явные, по одному на вид ГОСТ-блока):
+
+    1. ``<p class='org'|'country'|'num'>`` → ``<h1>`` — титульный блок;
+    2. пункты ``<ol>`` сразу после заголовка «Предисловие» → ``<h1>`` с
+       номером ``N`` (номер из текста рендерера отбрасывается — эталон пишет
+       «1 ПОДГОТОВЛЕН», а не «1. ПОДГОТОВЛЕН»);
+    3. абзац, начинающийся с ``<b>``/``<strong>`` и с многоточечным номером
+       («3.1 …», «6.2.2 …»), → ``<h{глубина+1}>``: глубина номера и есть
+       уровень заголовка;
+    4. абзац «ОКС …» → ``<h1>`` (в DOCX он тоже заголовок).
+
+    Чего правило НЕ делает: не трогает оглавление (``<ul>`` со строками
+    «1 Область применения … 1» — их гасит ``header_promoter``) и не превращает
+    в заголовки обычные абзацы. Пункты библиографии «[1] …» тоже не задеты:
+    номер там в квадратных скобках, а правило 3 требует ``<b>`` в начале.
+    """
+    if not html_content or not html_content.strip():
+        return html_content
+
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+    except Exception:  # noqa: BLE001 - битый HTML читаем как есть
+        return html_content
+
+    # 1. Титульный блок.
+    for node in soup.find_all("p"):
+        classes = set(node.get("class") or [])
+        if classes & set(TITLE_PAGE_HEADER_CLASSES):
+            node.name = "h1"
+
+    # 2. Пункты предисловия.
+    for heading in soup.find_all(re.compile(r"^h[1-6]$")):
+        title = _text_of(heading).casefold()
+        if not any(title.startswith(word) for word in PREFACE_WORDS):
+            continue
+        ordered_list = heading.find_next("ol")
+        if ordered_list is None:
+            continue
+        items = ordered_list.find_all("li", recursive=False)
+        if not items:
+            continue
+        for index, item in enumerate(items, start=1):
+            text = LIST_NUMBER_PREFIX_RE.sub("", _text_of(item), count=1)
+            heading = soup.new_tag("h1")
+            heading.string = f"{index} {text}"
+            item.replace_with(heading)
+        ordered_list.unwrap()
+
+    # 3. Термины и подразделы, набранные полужирным в начале абзаца.
+    for paragraph in soup.find_all("p"):
+        if _leading_bold(paragraph) is None:
+            continue
+        match = DOTTED_NUMBER_RE.match(_text_of(paragraph))
+        if not match:
+            continue
+        depth = len(match.group(1).split("."))
+        paragraph.name = f"h{min(_MAX_HEADING_LEVEL, depth + 1)}"
+
+    # 4. Строка классификации.
+    for paragraph in soup.find_all("p"):
+        if CLASSIFICATION_RE.match(_text_of(paragraph)):
+            paragraph.name = "h1"
+
+    # 5. Пункты списка, пронумерованные в самом тексте («[1] ISO/IEC …»), —
+    #    абзацы, а не элементы списка (см. BRACKETED_ITEM_RE).
+    for item in soup.find_all("li"):
+        if not BRACKETED_ITEM_RE.match(_text_of(item)):
+            continue
+        item.name = "p"
+        parent = item.parent
+        if parent is not None and parent.name == "ol":
+            parent.unwrap()
+
+    return str(soup)
 
 
 def _rows_to_markdown(rows: Sequence[Sequence[str]]) -> str:

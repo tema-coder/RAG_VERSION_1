@@ -11,13 +11,16 @@
 * ``.doc`` / ``.odt`` / ``.rtf`` — dedoc конвертирует их в DOCX вызовом
   ``soffice --headless``, поэтому в системе должен стоять LibreOffice
   (``sudo apt install libreoffice``). Без него эти форматы не читаются;
-* ``.xml`` — читается ``RawTextReader`` (dedoc относит XML к txt-подобным);
-* ``.md`` — нативно dedoc не знает. Файл копируется во временный ``.txt``
-  и парсится как обычный текст: полагаться на то, что dedoc сам откатится
-  с ``text/markdown`` на ``text/plain``, нельзя — это недокументированное
-  поведение, и оно молча ломает разбор при смене версии dedoc;
+* ``.xml`` — свой препроцессор ``xml_preprocessor`` переписывает теги в HTML
+  (иначе ``RawTextReader`` игнорирует их и структура теряется полностью);
+* ``.md`` — ``markdown_preprocessor`` рендерит markdown в HTML через
+  ``mistune`` (dedoc markdown не знает, а откат на ``text/plain`` —
+  недокументированное поведение, и оно молча ломает разбор при смене версии);
+* ``.pdf`` — по умолчанию идёт через ``pdf2docx`` в DOCX (см.
+  ``PDF_VIA_DOCX`` и ``parsers/pdf_via_docx.py``): нативный PDF-ридер теряет
+  структуру и таблицы;
 * ``.xls`` — конвертируется в ``.xlsx`` через ``xlrd``+``openpyxl``,
-  чтобы не зависеть от LibreOffice наlegacy-файлах.
+  чтобы не зависеть от LibreOffice на legacy-файлах.
 
 Артефакты на диске (``output/dedoc_results/``):
 
@@ -296,13 +299,16 @@ def prepare_for_parsing(path: Path) -> PreparedInput:
                 return PreparedInput(path, ".txt", None, [])
             return PreparedInput(temp_path, ".html", temp_path, tables)
 
-        from rag_parser.parsers.html_preprocessor import inject_table_markers
+        from rag_parser.parsers.html_preprocessor import (
+            inject_table_markers,
+            promote_gost_structure,
+        )
 
         try:
             html = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return PreparedInput(path, extension, None, [])
-        marked, tables = inject_table_markers(html)
+        marked, tables = inject_table_markers(promote_gost_structure(html))
         if not tables:
             return PreparedInput(path, extension, None, [])
         target_dir = settings.ensure_temp_dir()
@@ -462,7 +468,9 @@ class DedocParser(BaseParser):
     def parse(self, file_path: Path) -> ParseResult:
         from rag_parser.parsers.dedoc_tree import (
             build_full_tree,
+            drop_header_only_tables,
             full_tree_to_markdown,
+            normalize_markup_levels,
             reattach_tables,
         )
         from rag_parser.parsers.header_promoter import promote_headers
@@ -544,6 +552,14 @@ class DedocParser(BaseParser):
 
         content = tree.get("content", {}) or {}
         tables = content.get("tables") or []
+        if converted is not None and extension not in (".xlsx", ".xls"):
+            # Файл шёл через конвертацию (doc/odt/rtf -> docx, pdf -> docx).
+            # Конвертер дробит таблицы по границам страниц и оставляет куски
+            # из одной шапки; в исходном документе таких таблиц нет, поэтому
+            # отбрасываем их до привязки, а не после (см.
+            # dedoc_tree.drop_header_only_tables).
+            tables = drop_header_only_tables(tables)
+            content["tables"] = tables
         if extension in (".xlsx", ".xls"):
             # Точная заливка по диапазонам книги (для xls — по
             # сконвертированному файлу с перенесёнными мёрджами);
@@ -558,6 +574,12 @@ class DedocParser(BaseParser):
         structure = content.get("structure") or {}
 
         full_root = build_full_tree(structure, None)
+        # У форматов с авторской разметкой тело документа начинается на уровень
+        # глубже титульного блока (``<h2>`` вместо ``<h1>``). До промоции
+        # приводим уровни к эталонной шкале, иначе пересборка вложенности
+        # разложит все разделы на уровень ниже нужного.
+        if extension in MARKUP_AUTHORITATIVE_EXTENSIONS:
+            normalize_markup_levels(full_root)
         # Для форматов с авторской разметкой (h1-h6, <section>) типы и
         # уровни от dedoc авторитетны, и жёсткие правила только мешают:
         # они подняли бы нумерованный пункт «1 ПОДГОТОВЛЕН ...» (это

@@ -29,7 +29,10 @@ from typing import List, Optional, Tuple
 
 import mistune
 
-from rag_parser.parsers.html_preprocessor import inject_table_markers
+from rag_parser.parsers.html_preprocessor import (
+    inject_table_markers,
+    promote_gost_structure,
+)
 
 __all__ = ["markdown_to_html", "prepare_markdown_for_dedoc"]
 
@@ -74,7 +77,11 @@ def markdown_to_html(text: str) -> str:
     """Рендерит Markdown в полноценный HTML-документ."""
     if not text or not text.strip():
         return _HTML_WRAPPER_OPEN + _HTML_WRAPPER_CLOSE
-    body = _keep_bold(_MARKDOWN(text))
+    # Порядок важен: разметку ГОСТ проставляем ДО замены ``<strong>`` на
+    # текстовые маркеры — правило «абзац начинается с полужирного номера»
+    # смотрит на теги, а не на их текст.
+    body = promote_gost_structure(_MARKDOWN(text))
+    body = _keep_bold(body)
     return _HTML_WRAPPER_OPEN + body + _HTML_WRAPPER_CLOSE
 
 
