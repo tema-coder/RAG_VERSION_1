@@ -42,22 +42,29 @@ EXACT_FORMATS = (
     "gost_report.odt",
     "gost_report.rtf",
     "gost_report.html",
-    "gost_report.md",
     "gost_report.txt",
 )
 
-#: Дельты самого исходника: чего файл физически не содержит.
-#: ``md``/``xml`` — нет двух строк титульного блока; в ``xml`` три строки
-#: заголовка лежат в одном ``<title>`` одной строкой; ``txt`` — верхний
-#: регистр, поэтому сверяем регистронезависимо.
+#: Форматы с дельтой самого исходника: чего файл физически не содержит.
+#: ``md``/``xml`` — нет двух строк титульного блока («ПО ТЕХНИЧЕСКОМУ
+#: РЕГУЛИРОВАНИЮ И МЕТРОЛОГИИ», «НАЦИОНАЛЬНЫЙ СТАНДАРТ РОССИЙСКОЙ
+#: ФЕДЕРАЦИИ»); в ``xml`` три строки заголовка лежат в одном ``<title>``
+#: одной строкой без разделителей; ``txt`` — верхний регистр, поэтому
+#: сверяем регистронезависимо.
 SOURCE_DELTAS = {
+    "gost_report.md": 2,
     "gost_report.xml": 4,
     "gost_report.txt": 0,
     "gost_report.pdf": 6,
 }
 
+#: Один заголовок = один чанк: столько же чанков, сколько заголовков.
+MD_DELTA_HEADERS = 2
+MD_DELTA_CHUNKS = 2
+
 ALL_FORMATS = EXACT_FORMATS + (
     "gost_report.pdf",
+    "gost_report.md",
     "gost_report.xml",
 )
 
@@ -145,12 +152,12 @@ class TestTreeParity:
         result = _parse(filename)
         assert result.tree.metadata.get("orphan_tables", 0) <= 1
 
-    @pytest.mark.parametrize("filename", EXACT_FORMATS)
+    @pytest.mark.parametrize("filename", EXACT_FORMATS + ("gost_report.md",))
     def test_toc_suppressed(self, filename):
         result = _parse(filename)
         assert result.tree.metadata["toc_suppressed"] == ETALON_TOC_SUPPRESSED
 
-    @pytest.mark.parametrize("filename", EXACT_FORMATS)
+    @pytest.mark.parametrize("filename", EXACT_FORMATS + ("gost_report.md",))
     def test_no_toc_lines_became_headers(self, filename):
         result = _parse(filename)
         titles = [header.text for header in _headers(result.tree)]
@@ -166,7 +173,7 @@ class TestTreeParity:
                 continue
             assert titles[child].level == titles[parent].level + 1
 
-    @pytest.mark.parametrize("filename", EXACT_FORMATS)
+    @pytest.mark.parametrize("filename", ALL_FORMATS)
     def test_no_decoration_lines_in_tree(self, filename):
         """Разделители «======» — оформление, а не текст документа."""
         result = _parse(filename)
@@ -197,7 +204,7 @@ class TestChunkParity:
                 continue
             assert ">" in chunk.breadcrumb or chunk.breadcrumb.strip()
 
-    @pytest.mark.parametrize("filename", EXACT_FORMATS)
+    @pytest.mark.parametrize("filename", ALL_FORMATS)
     def test_table_chunks_are_single_rows(self, filename):
         result = _parse(filename)
         table_chunks = [
@@ -220,6 +227,47 @@ class TestChunkParity:
 
 class TestSourceDeltas:
     """Форматы, у которых дельта заложена в самом исходнике."""
+
+    def test_md_lacks_only_two_title_lines(self):
+        """В ``.md`` нет двух строк титула — и только их.
+
+        Всё остальное обязано совпасть с эталоном: если дельта выросла,
+        значит препроцессор перестал поднимать пункты предисловия, термины,
+        названия приложений или строку «ОКС».
+        """
+        result = _parse("gost_report.md")
+        titles = [header.text for header in _headers(result.tree)]
+        expected = ETALON_HEADERS - SOURCE_DELTAS["gost_report.md"]
+        assert len(titles) == expected
+
+        # Шапка начинается с обозначения стандарта — первых двух строк нет.
+        assert titles[0] == "ГОСТ Р 99999—2026"
+        assert all(titles)
+        # Структура тела на месте.
+        assert any(title.startswith("1 ПОДГОТОВЛЕН") for title in titles)
+        assert any(title.startswith("3.1 ") for title in titles)
+        assert "Приложение А (справочное)" in titles
+        assert "Пример использования настоящего стандарта" in titles
+        assert "ОКС 35.240.99" in titles
+
+    def test_md_keeps_bibliography_paragraphs(self):
+        """Пункты «[1] …» остаются абзацами, а не «1. [1] …».
+
+        Регрессия: переименование ``<li>`` в ``<p>`` внутри ``<ul>`` приводило
+        к тому, что рендерер выбрасывал всю библиографию вместе с текстом.
+        """
+        result = _parse("gost_report.md")
+        chunk_texts = [" ".join(chunk.text.split()) for chunk in _chunks(result, "gost_report.md")]
+        for number in (1, 2, 3, 4):
+            expected = f"[{number}] "
+            assert any(text.startswith(expected) for text in chunk_texts), (
+                f"запись библиографии [{number}] потеряна или получила лишнюю нумерацию"
+            )
+
+    def test_md_chunk_count(self):
+        """На каждый заголовок — один чанк: 193 − 2 отсутствующих строки титула."""
+        result = _parse("gost_report.md")
+        assert len(_chunks(result, "gost_report.md")) == 193 - MD_DELTA_CHUNKS
 
     def test_xml_keeps_all_available_structure(self):
         """В ``.xml`` нет двух строк титула и три строки заголовка слиты в одну.

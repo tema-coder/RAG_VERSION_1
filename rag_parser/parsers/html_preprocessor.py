@@ -176,15 +176,41 @@ def promote_gost_structure(html_content: str) -> str:
 
     # 5. Пункты списка, пронумерованные в самом тексте («[1] ISO/IEC …»), —
     #    абзацы, а не элементы списка (см. BRACKETED_ITEM_RE).
-    for item in soup.find_all("li"):
-        if not BRACKETED_ITEM_RE.match(_text_of(item)):
-            continue
-        item.name = "p"
-        parent = item.parent
-        if parent is not None and parent.name == "ol":
-            parent.unwrap()
+    _promote_bracketed_items_to_paragraphs(soup)
 
     return str(soup)
+
+
+def _promote_bracketed_items_to_paragraphs(soup) -> int:
+    """``<li>[1] …`` -> ``<p>[1] …</p>``, «1. [1] …» исчезает.
+
+    Рендере (``HtmlReader``) нумерует элементы списка, поэтому библиография
+    приходила как «1. [1] ISO/IEC …», тогда как в эталонном DOCX это обычный
+    абзац «[1] ISO/IEC …».
+
+    Важно: ``<li>`` нельзя просто переименовать в ``<p>`` — абзац внутри
+    ``<ul>``/``<ol>`` рендерер выбрасывает вместе с текстом. Поэтому пункт
+    ЗАМЕНЯЕТСЯ абзацем на уровне списка, а сам список расправляется, но только
+    если он плоский: во вложенном списке (оглавление с отступами) такое
+    преобразование сломало бы структуру, поэтому там пункт остаётся пунктом.
+    """
+    promoted = 0
+    for item in list(soup.find_all("li")):
+        if not BRACKETED_ITEM_RE.match(_text_of(item)):
+            continue
+        parent = item.parent
+        if parent is None or parent.name not in ("ol", "ul"):
+            continue
+        siblings = [child for child in parent.find_all("li", recursive=False)]
+        if any(child.find(["ol", "ul"]) for child in siblings):
+            continue  # вложенный список: не трогаем структуру
+        paragraph = soup.new_tag("p")
+        paragraph.string = _text_of(item)
+        item.replace_with(paragraph)
+        promoted += 1
+        if not parent.find(["li", "ol", "ul"]):
+            parent.unwrap()
+    return promoted
 
 
 def _rows_to_markdown(rows: Sequence[Sequence[str]]) -> str:
