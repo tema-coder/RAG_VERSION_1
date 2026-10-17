@@ -58,13 +58,10 @@ python -m pip install --upgrade pip
 # 2. Установка torch CPU отдельно (чтобы не тянуть CUDA ~1.2 ГБ)
 pip install torch==2.14.1+cpu --index-url https://download.pytorch.org/whl/cpu
 
-# 3. Установка dedoc без зависимостей (его пины 2023 года сломаны)
-pip install dedoc==2.8 
-
-# 4. Установка остального стека
+# 3. Установка остального стека
 pip install -r rag_parser/requirements.txt
 
-# 5. Системная зависимость для .doc/.odt/.rtf
+# 4. Системная зависимость для .doc/.odt/.rtf
 sudo apt-get install libreoffice-writer libreoffice-calc
 ```
 
@@ -121,6 +118,7 @@ Swagger UI: <http://localhost:8000/docs>.
 
 ```bash
 streamlit run rag_parser/frontend/app.py
+streamlit run frontend/app.py
 ```
 
 UI работает без запущенного API: парсер и чанкеры вызываются напрямую.
