@@ -39,10 +39,17 @@
    по уровням (lift распознанных заголовков из чужой вложенности).
 """
 
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from rag_parser.core.interfaces import DocumentNode
+
+#: Включает отладочный вывод ``classify_header`` для структурных заголовков
+#: («Раздел N», «Глава N» …). Активируется переменной окружения
+#: ``RAG_DEBUG_HEADERS=1`` — в тестах и боевом режиме выключен по умолчанию,
+#: чтобы не засорять stdout. См. Шаг 4 плана диагностики task.txt.
+_DEBUG_HEADERS = os.environ.get("RAG_DEBUG_HEADERS", "") not in ("", "0", "false", "no")
 
 #: Структурные слова в начале строки (правило 2).
 STRUCTURAL_WORDS = ("Раздел", "Глава", "Часть", "Том", "Книга")
@@ -91,8 +98,25 @@ _BOLD_TAIL_RE = re.compile(r"(?:\*{1,3}|</b>)\s*$", re.IGNORECASE)
 #: Базовый заголовок: «1 **Текст**» либо «1 НАЗВАНИЕ» (цифра + КАПС).
 _BASE_BOLD_RE = re.compile(r"^\d+[\.\)\s]+(?:\*\*.+?\*\*|__BOLD__)", re.IGNORECASE)
 _BASE_CAPS_RE = re.compile(r"^\d+[\.\)\s]+[А-ЯA-ZЁ\s]+$")
+#: Базовый заголовок: структурное слово + ОДНО число («Раздел 1.»,
+#: «Глава 2.», «Часть 3 »). ТЗ 1.2: «Раздел N» (где N — цифра) → базовый
+#: заголовок Level 1, сброс стека трекера. Negative lookahead ``(?!\.\d)``
+#: отсекает «Раздел 1.1» / «Глава 1.1.1» — там число составное, и это
+#: вложенный триггер (а не базовый заголовок), что проверяется тестом
+#: ``(["1 Текст", "Раздел 1.1", "Глава 1.1.1"], [1, 2, 3])``.
+#:
+#: Без этого правила «Раздел N» в теле документа (стиль не Heading, а
+#: «ConsNormal») уходил в keyword-ветку трекера и получал уровень 2/3
+#: вместо 1 — breadcrumb чанков 2.x становился «Оглавление:» вместо
+#: «Раздел 2. Сведения об Обществе» (2023.docx, см. task.txt).
+_BASE_STRUCTURAL_RE = re.compile(
+    r"^(?:Раздел|Глава|Часть|Том|Книга)\s+\d+(?!\.\d)(?:[.)\s]|$)",
+    re.IGNORECASE,
+)
 #: Ключевые слова-триггеры вложенности.
-_NEST_KEYWORD_RE = re.compile(r"^(Раздел|Глава|Параграф|Подраздел|Часть)[\s\d]", re.IGNORECASE)
+_NEST_KEYWORD_RE = re.compile(
+    r"^(Раздел|Глава|Параграф|Подраздел|Часть)[\s\d]", re.IGNORECASE
+)
 #: Максимальная глубина вложенности заголовков.
 MAX_HEADER_LEVEL = 3
 
@@ -417,9 +441,7 @@ class HeaderLevelTracker:
             # уровня) последний получал бы 2: после скользящего окна стек
             # содержит [(2, «6.2»), (3, «6.2.2»)], и соседство с «6.2.2»
             # обнуляло бы глубину до второго уровня.
-            new_level = (
-                previous_level if self.is_sibling(number, previous) else 3
-            )
+            new_level = previous_level if self.is_sibling(number, previous) else 3
         else:
             # Скользящее окно: уходим глубже максимума — режем верх.
             self.level_stack.pop(0)
@@ -449,10 +471,22 @@ class HeaderLevelTracker:
 
     @staticmethod
     def is_base_header(text: str) -> bool:
-        """Базовый заголовок: цифра + жирный либо цифра + КАПС."""
+        """Базовый заголовок: сбрасывает стек трекера на уровень 1.
+
+        ТЗ 1.2: «Раздел N» (где N — цифра) → базовый заголовок Level 1,
+        сброс стека трекера. Распознаёт три формы:
+
+        * «1 **Текст**» — цифра + жирный (markdown-маркеры);
+        * «1 НАЗВАНИЕ» — цифра + КАПС;
+        * «Раздел 1.» / «Глава 2.» / «Часть 3 » — структурное слово +
+          ОДНО число (без точек). Составные «Раздел 1.1» сюда НЕ входят:
+          это вложенный триггер (см. ``_BASE_STRUCTURAL_RE``).
+        """
         stripped = (text or "").strip()
         return bool(
-            _BASE_BOLD_RE.match(stripped) or _BASE_CAPS_RE.match(stripped)
+            _BASE_BOLD_RE.match(stripped)
+            or _BASE_CAPS_RE.match(stripped)
+            or _BASE_STRUCTURAL_RE.match(stripped)
         )
 
     @staticmethod
@@ -501,6 +535,18 @@ def classify_header(
 
     annotations = annotations or []
     level = numbering_level(stripped, allow_paren=allow_paren)
+
+    # Отладочный вывод для структурных заголовков «Раздел N» / «Глава N» …
+    # (Шаг 4 плана диагностики task.txt). Виден только при RAG_DEBUG_HEADERS=1.
+    if _DEBUG_HEADERS and _NEST_KEYWORD_RE.match(stripped):
+        import sys as _sys
+
+        print(
+            f"[DEBUG] classify_header: text={stripped[:60]!r} "
+            f"numbering_level={level} base_size={base_size} "
+            f"annotations={[(a.get('name'), a.get('value')) for a in annotations[:4]]}",
+            file=_sys.stderr,
+        )
 
     # Правила 6 и 7: нумерация в начале (в т.ч. «2.3 АНАЛИЗ ДАННЫХ» —
     # нумерация даёт уровень, КАПС остатка подтверждает заголовок).
@@ -730,9 +776,7 @@ def _presplit(node: DocumentNode) -> List[DocumentNode]:
                 level=node.level,
                 text=node.text,
                 children=[
-                    piece
-                    for child in node.children
-                    for piece in _presplit(child)
+                    piece for child in node.children for piece in _presplit(child)
                 ],
                 metadata=dict(node.metadata),
             )
@@ -744,9 +788,7 @@ def _presplit(node: DocumentNode) -> List[DocumentNode]:
                 level=node.level,
                 text=node.text,
                 children=[
-                    piece
-                    for child in node.children
-                    for piece in _presplit(child)
+                    piece for child in node.children for piece in _presplit(child)
                 ],
                 metadata=dict(node.metadata),
             )

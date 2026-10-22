@@ -405,6 +405,212 @@ class TestHeaderLevelTracker:
         assert HeaderLevelTracker.extract_number("Раздел 1.1") == ""
 
 
+class TestRazdelBaseHeaderReset:
+    """РЕГРЕССИЯ 2023.docx: «Раздел N» — базовый заголовок Level 1 (сброс стека).
+
+    ТЗ 1.2: «Раздел N» (где N — цифра) → базовый заголовок Level 1, сброс
+    стека трекера. До фикса ``is_base_header`` не распознавал «Раздел N», и
+    тот уходил в keyword-ветку: «Раздел 1» → L2 (ребро «Оглавление»),
+    «Раздел 2» → L3, а 2.x получали orphan-уровень 2 и после пересборки
+    оказывались под «Оглавление» — breadcrumb чанка 2.1 был «Оглавление:»
+    вместо «Раздел 2. Сведения об Обществе».
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Раздел 1. Информация о годовом отчете",
+            "Раздел 2. Сведения об Обществе",
+            "Раздел 14. Сведения о соблюдении Кодекса",
+            "Раздел 1",          # без точки и текста — тоже базовый
+            "Глава 2. Общая часть",
+            "Часть 3. Дополнительные требования",
+            "Том 1. Архив",
+            "Книга 5. Приложения",
+            "раздел 9. Основные факторы риска",  # регистронезависимо
+        ],
+    )
+    def test_razdel_single_number_is_base_header(self, text):
+        assert HeaderLevelTracker.is_base_header(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Раздел 1.1",          # составной номер — вложенный триггер
+            "Глава 1.1.1",
+            "Раздел 1.1. Первое положение",
+            "Разделение труда",    # не структурное слово
+            "Раздельность",        # префикс ловиться не должен
+            "1 Текст",             # цифра без КАПС/жирного — не базовый
+            "Обычный текст",
+        ],
+    )
+    def test_dotted_or_non_structural_is_not_base_header(self, text):
+        assert HeaderLevelTracker.is_base_header(text) is False
+
+    def test_razdel_resets_stack_to_level_1(self):
+        """«Оглавление» → «Раздел 1» → «Раздел 2» → «2.1» = [1, 1, 1, 2].
+
+        Воспроизводит порядок заголовков 2023.docx. До фикса давало
+        [1, 2, 3, 2] (Раздел 1 → L2, Раздел 2 → L3, 2.1 → orphan L2).
+        """
+        tracker = HeaderLevelTracker()
+        levels = [
+            tracker.calculate_level("Оглавление:"),
+            tracker.calculate_level("Раздел 1. Информация о годовом отчете"),
+            tracker.calculate_level("Раздел 2. Сведения об Обществе"),
+            tracker.calculate_level("2.1. Полное наименование: АО «СТАРТ»."),
+            tracker.calculate_level("2.2. Сокращенное наименование: АО «СТАРТ»."),
+            tracker.calculate_level("Раздел 3. Положение акционерного общества"),
+            tracker.calculate_level("Раздел 9. Основные факторы риска"),
+            tracker.calculate_level("9.1. Отраслевые риски"),
+        ]
+        assert levels == [1, 1, 1, 2, 2, 1, 1, 2]
+
+    def test_razdel_does_not_deepen_after_subitems(self):
+        """После 2.x новый «Раздел 3» снова Level 1, а не Level 3.
+
+        Регрессия: до фикса «Раздел 3» шёл в keyword-ветку при глубоком
+        стеке и получал cap=3, после пересборки становился ребёнком 2.9.
+        """
+        tracker = HeaderLevelTracker()
+        sequence = [
+            "Оглавление:",
+            "Раздел 2. Сведения об Обществе",
+            "2.1. Полное наименование",
+            "2.9. Номер телефона",
+            "Раздел 3. Положение в отрасли",
+        ]
+        levels = [tracker.calculate_level(text) for text in sequence]
+        assert levels == [1, 1, 2, 2, 1]
+
+    def test_dotted_razdel_still_nests(self):
+        """«Раздел 1.1» — вложенный триггер (не базовый), поведение сохранено.
+
+        Существующий инвариант: ``["1 Текст", "Раздел 1.1", "Глава 1.1.1"]``
+        → [1, 2, 3]. Фикс «Раздел N» его не ломает: dotted-номер не base.
+        """
+        tracker = HeaderLevelTracker()
+        levels = [
+            tracker.calculate_level("1 Текст"),
+            tracker.calculate_level("Раздел 1.1"),
+            tracker.calculate_level("Глава 1.1.1"),
+        ]
+        assert levels == [1, 2, 3]
+
+
+class TestRazdelEndToEnd:
+    """Сквозная проверка promote_headers на структуре 2023.docx.
+
+    Дерево строится вручную (без dedoc) из ключевых строк годового отчёта:
+    титул, «Оглавление», 14 TOC-записей «Раздел N», тело «Раздел 1/2/9» с
+    подпунктами 2.x и 9.x. Проверяется, что тело «Раздел N» — Level 1, а
+    2.1 лежит под «Раздел 2» (breadcrumb «Раздел 2 …», НЕ «Оглавление:»).
+    """
+
+    @staticmethod
+    def _build_2023_tree() -> DocumentNode:
+        title = [
+            DocumentNode(type="raw_text", level=0, text=t, children=[], metadata={})
+            for t in ("ГОДОВОЙ ОТЧЕТ", "АКЦИОНЕРНОГО ОБЩЕСТВА «СТАРТ»", "ЗА 2023 ГОД")
+        ]
+        toc_entries = [
+            DocumentNode(
+                type="raw_text", level=0, text=f"Раздел {n}. Раздел №{n}",
+                children=[], metadata={},
+            )
+            for n in range(1, 15)
+        ]
+        section1 = [
+            DocumentNode(type="raw_text", level=0, text="Во исполнение закона…",
+                         children=[], metadata={}),
+        ]
+        section2 = [
+            DocumentNode(
+                type="raw_text", level=0,
+                text=f"2.{n}. Пункт 2.{n}",
+                children=[], metadata={},
+            )
+            for n in range(1, 10)
+        ]
+        section9 = [
+            DocumentNode(type="raw_text", level=0, text=f"9.{n}. Риск 9.{n}",
+                         children=[], metadata={})
+            for n in range(1, 4)
+        ]
+        children = title + [
+            DocumentNode(type="raw_text", level=0, text="Оглавление:",
+                         children=[], metadata={}),
+            *toc_entries,
+            DocumentNode(type="raw_text", level=0,
+                         text="Раздел 1. Информация о годовом отчете",
+                         children=[], metadata={}),
+            *section1,
+            DocumentNode(type="raw_text", level=0,
+                         text="Раздел 2. Сведения об Обществе",
+                         children=[], metadata={}),
+            *section2,
+            DocumentNode(type="raw_text", level=0,
+                         text="Раздел 3. Положение акционерного общества в отрасли",
+                         children=[], metadata={}),
+            DocumentNode(type="raw_text", level=0,
+                         text="Раздел 9. Основные факторы риска",
+                         children=[], metadata={}),
+            *section9,
+        ]
+        return DocumentNode(type="document", level=0, text="", children=children,
+                            metadata={})
+
+    def test_razdel_body_sections_are_level_1(self):
+        from rag_parser.parsers.dedoc_tree import collect_headers
+
+        root = promote_headers(self._build_2023_tree())
+        headers = {h.text: h.level for h in collect_headers(root)}
+        # Тело «Раздел N» — Level 1 (новый базовый), не L2/L3.
+        assert headers["Раздел 1. Информация о годовом отчете"] == 1
+        assert headers["Раздел 2. Сведения об Обществе"] == 1
+        assert headers["Раздел 3. Положение акционерного общества в отрасли"] == 1
+        assert headers["Раздел 9. Основные факторы риска"] == 1
+
+    def test_subitems_nest_under_their_razdel(self):
+        """2.1 — ребёнок «Раздел 2» (Level 2), а не «Оглавление»."""
+        from rag_parser.parsers.dedoc_tree import collect_headers
+
+        root = promote_headers(self._build_2023_tree())
+        headers = collect_headers(root)
+        by_text = {h.text: h for h in headers}
+        assert by_text["2.1. Пункт 2.1"].level == 2
+        assert by_text["9.1. Риск 9.1"].level == 2
+
+    def test_toc_entries_are_suppressed(self):
+        """14 TOC-записей «Раздел N» подавлены (series detection), не заголовки."""
+        from rag_parser.parsers.dedoc_tree import collect_headers
+
+        root = promote_headers(self._build_2023_tree())
+        header_texts = [h.text for h in collect_headers(root)]
+        # TOC-записи «Раздел N. Раздел №N» не должны стать заголовками.
+        assert not any("Раздел №" in t for t in header_texts)
+        assert root.metadata["toc_suppressed"] == 14
+
+    def test_no_razdel_body_nests_under_oglavenie(self):
+        """Ни один телесный «Раздел N» не ребёнок «Оглавление:».
+
+        До фикса «Раздел 1» был ребёнком «Оглавление:» (L2), и breadcrumb
+        его контента был «Оглавление: > Раздел 1 …». После фикса «Раздел 1»
+        — top-level, его контент лежит прямо под ним.
+        """
+        from rag_parser.parsers.dedoc_tree import collect_headers
+
+        root = promote_headers(self._build_2023_tree())
+        oglavenie = next(
+            h for h in collect_headers(root) if h.text == "Оглавление:"
+        )
+        oglavenie_children_text = " ".join(c.text for c in oglavenie.children)
+        # Тело «Раздел 1» НЕ ребёнок «Оглавление:».
+        assert "Раздел 1. Информация о годовом отчете" not in oglavenie_children_text
+        assert "Раздел 2. Сведения об Обществе" not in oglavenie_children_text
+
+
 class TestBoldTrigger:
     """Триггер жирного текста и его очистка из результата."""
 
