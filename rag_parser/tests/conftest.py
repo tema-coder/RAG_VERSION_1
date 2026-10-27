@@ -20,7 +20,9 @@ HTML_DOC = (
     "<h2>Подзаголовок</h2><table><tr><th>A</th><th>B</th></tr>"
     "<tr><td>1</td><td>2</td></tr></table></body></html>"
 )
-HTML_MINIMAL = "<html><body><h3>Title</h3><ul><li>one</li><li>two</li></ul></body></html>"
+HTML_MINIMAL = (
+    "<html><body><h3>Title</h3><ul><li>one</li><li>two</li></ul></body></html>"
+)
 SENTENCE_TEXT = (
     "Машинное обучение изучает алгоритмы, которые учатся на данных. "
     "Модели достигают высокой точности на проверочных наборах. "
@@ -38,7 +40,9 @@ def write_bytes(path: Path, data: bytes) -> Path:
 def make_text_files(tmp_path: Path) -> dict:
     return {
         "txt_utf8": write_bytes(tmp_path / "utf8.txt", TXT_UTF8.encode("utf-8")),
-        "txt_latin1": write_bytes(tmp_path / "latin1.txt", TXT_LATIN1.encode("latin-1")),
+        "txt_latin1": write_bytes(
+            tmp_path / "latin1.txt", TXT_LATIN1.encode("latin-1")
+        ),
         "md": write_bytes(tmp_path / "doc.md", MD_DOC.encode("utf-8")),
     }
 
@@ -337,7 +341,9 @@ def make_pdf_files(tmp_path: Path) -> dict:
 
 def make_invalid_files(tmp_path: Path) -> dict:
     return {
-        "broken_pdf": write_bytes(tmp_path / "broken.pdf", b"%PDF-1.4\nnot really a pdf"),
+        "broken_pdf": write_bytes(
+            tmp_path / "broken.pdf", b"%PDF-1.4\nnot really a pdf"
+        ),
         "empty_pdf": write_bytes(tmp_path / "empty.pdf", b""),
         "not_a_pdf": write_bytes(tmp_path / "fake.pdf", b"plain text file"),
         "empty_txt": write_bytes(tmp_path / "empty.txt", b""),
@@ -427,3 +433,21 @@ def client(tmp_path, monkeypatch):
     with TestClient(app, raise_server_exceptions=False) as test_client:
         yield test_client
     routes.document_store = previous
+
+
+@pytest.fixture(autouse=True)
+def _disable_pdf_pipeline_for_legacy_tests(monkeypatch):
+    """Отключает новый PDF-пайплайн (USE_PDF_PIPELINE=False) для старых тестов.
+
+    Промпт promt_for_parse_pdf.txt: «В юнит-тестах Docling не загружается.»
+    Старые API/парсер-тесты идут через legacy-путь (pdf_via_docx / dedoc),
+    который работает без Docling. Новый пайплайн тестируется отдельно в
+    ``test_pdf_pipeline.py`` с моками Docling.
+
+    Тесты, которым нужен новый пайплайн, могут переопределить настройку
+    через ``monkeypatch.setattr(settings, "USE_PDF_PIPELINE", True)``.
+    """
+    from rag_parser.core.config import settings
+
+    monkeypatch.setattr(settings, "USE_PDF_PIPELINE", False)
+    yield

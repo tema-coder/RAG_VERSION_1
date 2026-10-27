@@ -31,6 +31,29 @@ class ChunkResponse(BaseModel):
     chunk_order: int = 0
 
 
+class ArchitecturalChunkResponse(BaseModel):
+    """Архитектурный чанк BEAR (для Parent-Child retrieval в SearchService).
+
+    НОВАЯ схема — НЕ заменяет ``ChunkResponse`` (старое поле ``chunks``
+    в ``ParseResponse`` остаётся нетронутым для совместимости с фронтом).
+    Новое опциональное поле ``architectural_chunks`` содержит чанки в
+    формате, готовом к эмбеддингу и сохранению в PostgreSQL/Qdrant.
+
+    ``text`` — обогащённый текст для эмбеддинга (маппится из
+    внутреннего ``Chunk.text_for_embedding``). ``metadata`` несёт
+    ``parent_id``, ``block_type``, ``breadcrumb`` для Parent-Child
+    retrieval (см. ``docs/parent_child_retrieval_contract.md``).
+    """
+
+    id: str
+    document_id: str
+    document_version: int
+    sequence: int
+    text: str
+    token_count: int
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class TreeNode(BaseModel):
     type: str
     level: int
@@ -49,6 +72,7 @@ class ParseResponse(BaseModel):
     pages: Optional[int] = None
     markdown: str
     chunks: Optional[List[ChunkResponse]] = None
+    architectural_chunks: Optional[List[ArchitecturalChunkResponse]] = None
     tree: Optional[TreeNode] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 

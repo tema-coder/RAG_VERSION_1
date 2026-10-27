@@ -265,7 +265,6 @@ def prepare_for_parsing(path: Path) -> PreparedInput:
     extension = path.suffix.lower()
 
     if extension in (".html", ".htm", ".md", ".xml", ".txt"):
-
         if extension == ".md":
             from rag_parser.parsers.markdown_preprocessor import (
                 prepare_markdown_for_dedoc,
@@ -319,7 +318,6 @@ def prepare_for_parsing(path: Path) -> PreparedInput:
     alias = TEXT_ALIAS_EXTENSIONS.get(extension)
     if alias is None:
         return PreparedInput(path, extension, None, [])
-
 
     target_dir = settings.ensure_temp_dir()
     alias_path = target_dir / f"{path.stem}{alias}"
@@ -492,6 +490,14 @@ class DedocParser(BaseParser):
         if extension not in SUPPORTED_EXTENSIONS:
             raise UnsupportedFormatError(extension, SUPPORTED_EXTENSIONS)
 
+        # --- Новый PDF-пайплайн (промпт promt_for_parse_pdf.txt) ---
+        # PDF → classify → route (text_parser / docling / docling_ocr) →
+        # assemble Markdown → существующий .md-путь (mistune → HTML →
+        # HtmlReader → header_promoter → chunking). Docling больше не
+        # читает PDF напрямую.
+        if extension == ".pdf" and settings.USE_PDF_PIPELINE:
+            return self._parse_pdf_via_pipeline(path, size_bytes)
+
         self._validate_container(path, extension)
         require_libreoffice(extension, path.name)
 
@@ -635,6 +641,111 @@ class DedocParser(BaseParser):
                 "markdown_path": str(paths["markdown"]),
                 "output_dir": str(paths["output_dir"]),
             },
+            tree=full_root,
+        )
+
+    def _parse_pdf_via_pipeline(self, path: Path, size_bytes: int) -> ParseResult:
+        """Новый PDF-пайплайн: classify → route → assemble MD → .md-путь.
+
+        Промпт ``promt_for_parse_pdf.txt``: PDF через маршрутизацию
+        (текст/скан/таблицы) → Markdown → существующий ``.md``-путь
+        (mistune → HTML → HtmlReader → ``header_promoter`` → chunking).
+        Docling больше не читает PDF напрямую.
+        """
+        from rag_parser.parsers.docling_converter import DoclingError
+        from rag_parser.parsers.pdf_pipeline import run_pipeline
+
+        ocr_langs = tuple(settings.DOCLING_OCR_LANGS.split(","))
+        try:
+            pipeline_result = run_pipeline(
+                path,
+                min_chars_per_page=settings.PDF_TEXT_MIN_CHARS_PER_PAGE,
+                text_pages_min_ratio=settings.PDF_TEXT_PAGES_MIN_RATIO,
+                ocr_engine=settings.DOCLING_OCR_ENGINE,
+                ocr_langs=ocr_langs,
+            )
+        except DoclingError as exc:
+            # Скан + Docling упал — понятная ошибка (не 500).
+            raise DocumentParseError(
+                f"PDF scan processing failed: {exc.message}",
+                filename=path.name,
+            ) from exc
+
+        markdown = pipeline_result.markdown
+        if not markdown.strip():
+            raise DocumentParseError(
+                "PDF pipeline produced no text", filename=path.name
+            )
+
+        # Сохраняем MD во временный файл и отдаём через существующий .md-путь.
+        temp_dir = settings.ensure_temp_dir()
+        md_path = temp_dir / f"{path.stem}_pipeline.md"
+        md_path.write_text(markdown, encoding="utf-8")
+        try:
+            prepared = prepare_for_parsing(md_path)
+            effective_path = prepared.path
+            effective_extension = prepared.extension
+            html_tables = prepared.html_tables
+            converted = prepared.temp_path
+
+            manager = prepare_manager_for_format(effective_extension)
+            parsed = manager.parse(
+                str(effective_path),
+                parameters=parameters_for_format(effective_extension, effective_path),
+            )
+            document = parsed.to_api_schema()
+            tree = document.model_dump()
+        finally:
+            md_path.unlink(missing_ok=True)
+            if converted is not None:
+                converted.unlink(missing_ok=True)
+
+        content = tree.get("content", {}) or {}
+        tables = content.get("tables") or []
+        structure = content.get("structure") or {}
+
+        from rag_parser.parsers.dedoc_tree import (
+            build_full_tree,
+            full_tree_to_markdown,
+            normalize_markup_levels,
+            reattach_tables,
+        )
+        from rag_parser.parsers.header_promoter import promote_headers
+
+        full_root = build_full_tree(structure, None)
+        # .md — авторская разметка, promote_non_headers=False.
+        normalize_markup_levels(full_root)
+        full_root = promote_headers(full_root, promote_non_headers=False)
+        reattach_tables(full_root, tables)
+        if html_tables:
+            from rag_parser.parsers.dedoc_tree import attach_tables_by_position
+
+            attach_tables_by_position(full_root, html_tables)
+
+        final_markdown = full_tree_to_markdown(full_root)
+        if not final_markdown.strip():
+            raise DocumentParseError(
+                "Converted PDF contains no text", filename=path.name
+            )
+        final_markdown = self._clean(final_markdown)
+
+        document_id = self._new_document_id()
+        paths = self.save_results(document_id, tree, final_markdown)
+        pipeline_metadata = pipeline_result.metadata
+        pipeline_metadata["format"] = self.format
+        pipeline_metadata["extension"] = ".pdf"
+        pipeline_metadata["size_bytes"] = size_bytes
+        pipeline_metadata["parser"] = "pdf_pipeline"
+        pipeline_metadata["raw_tree_path"] = str(paths["raw_tree"])
+        pipeline_metadata["markdown_path"] = str(paths["markdown"])
+        pipeline_metadata["output_dir"] = str(paths["output_dir"])
+
+        return ParseResult(
+            document_id=document_id,
+            filename=path.name,
+            format=self.format,
+            markdown=final_markdown,
+            metadata=pipeline_metadata,
             tree=full_root,
         )
 

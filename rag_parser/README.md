@@ -54,12 +54,11 @@ breadcrumb-обогащением чанков, Child-Parent развёртко�
 # 1. Создание окружения (строго Python 3.10)
 python3.10 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
-
+pip install --no-deps dedoc==2.8
+pip install dedoc-utils==0.3.11
 # 2. Установка torch CPU отдельно (чтобы не тянуть CUDA ~1.2 ГБ)
-pip install torch==2.14.1+cpu --index-url https://download.pytorch.org/whl/cpu
 
-# 3. Установка dedoc без зависимостей (его пины 2023 года сломаны)
-pip install dedoc==2.8 
+
 
 # 4. Установка остального стека
 pip install -r rag_parser/requirements.txt

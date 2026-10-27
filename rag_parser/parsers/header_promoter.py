@@ -1080,6 +1080,159 @@ def promote_headers(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Приоритетная система (промпт promt_for_right_work_with_head_page.txt).
+# Делегирует классификацию модулю priority_rules. Старый promote_headers
+# остаётся для обратной совместимости; новый путь включается флагом
+# USE_PRIORITY_HEADER в core/config.py (default True для txt/docx/pdf).
+# --------------------------------------------------------------------------- #
+
+
+def promote_headers_priority(
+    root: DocumentNode,
+    *,
+    source: str = "docx",
+    base_size: Optional[float] = None,
+) -> DocumentNode:
+    """Приоритетная промоция заголовков (S → P0 → P1 → P2 → P3 → P4 → P5).
+
+    Не мутирует вход. Переиспользует существующие механизмы:
+    * пре-сплит многострочных листьев (``_presplit``);
+    * TOC-подавление (``_mark_toc`` + ``_mark_toc_section``) — области
+      «Содержание»/TOC-серии гасятся до классификации, S_TOC в
+      ``priority_rules`` ловит отдельные TOC-записи;
+    * ребилд дерева (``_rebuild``) — пересборка по уровням из прохода 4.
+
+    :param source: источник строк (``"docx"``, ``"txt"``, ``"md"``, ``"pdf"``)
+        — определяет, как считается emphasis (по аннотациям или маркерам).
+    :param base_size: базовый кегль документа (для docx, правило size ≥13pt).
+    """
+    from rag_parser.parsers.priority_rules import (
+        build_tree,
+        classify_line,
+        emphasis_from_annotations,
+        emphasis_from_text_markers,
+        assign_ranks,
+        validate_chains,
+    )
+
+    # Проход 0: пре-сплит + сбор линий в порядке документа.
+    split_children: List[DocumentNode] = []
+    for child in root.children:
+        split_children.extend(_presplit(child))
+    scan: List[DocumentNode] = []
+
+    def _collect(nodes: List[DocumentNode]) -> None:
+        for item in nodes:
+            if item.type == "document":
+                _collect(item.children)
+            else:
+                scan.append(item)
+                _collect(item.children)
+
+    _collect(split_children)
+
+    # TOC-подавление (переиспользуем старые механизмы — они помечают
+    # metadata["toc"]=True на TOC-записях).
+    scan_lines = [node for node in scan if not node.children]
+    toc_suppressed = _mark_toc(scan_lines) + _mark_toc_section(scan)
+
+    # Классификация каждой строки.
+    classifications = []
+    line_nodes: List[DocumentNode] = []  # параллельный список узлов
+    for node in scan:
+        text = (node.text or "").strip()
+        if not text:
+            continue
+        # TOC-записи — подавлены, не классифицируем.
+        if node.metadata.get("toc"):
+            classifications.append(None)
+            line_nodes.append(node)
+            continue
+        # Узлы, которые dedoc уже пометил как header (стиль Heading в DOCX),
+        # принимаем как заголовки без классификации — priority-rules не
+        # применяется к документам со стилями (спецификация: «заменяет
+        # промоцию там, где она применяется сейчас: txt, docx без стилей,
+        # PDF-origin Markdown»). Confidence=source (dedoc решил).
+        # Уровень берём из node.level (dedoc hierarchy_level) — он уже
+        # корректный (Heading 1 → 1, Heading 2 → 2, …).
+        if node.type == "header":
+            from rag_parser.parsers.priority_rules import (
+                LineClassification as _LC,
+                CONFIDENCE_SOURCE,
+            )
+            dedoc_level = max(1, int(node.level or 1))
+            classifications.append(_LC(
+                text=text, rule="dedoc", kind="dedoc",
+                number=None, title=text, confidence=CONFIDENCE_SOURCE,
+                metadata={"components": 1, "dedoc_level": dedoc_level},
+            ))
+            line_nodes.append(node)
+            continue
+        # emphasis: docx — по аннотациям; txt/md — по маркерам в тексте.
+        if source == "docx":
+            emph = emphasis_from_annotations(_annotations_of(node), text, base_size)
+        else:
+            emph = emphasis_from_text_markers(text)
+        c = classify_line(text, source=source, emphasis=emph, md_level=None)
+        classifications.append(c)
+        line_nodes.append(node)
+
+    # Проход 2: валидация цепочек (только для не-None классификаций).
+    valid_classes = [c for c in classifications if c is not None]
+    valid_classes = validate_chains(valid_classes)
+
+    # Проход 3: ранги.
+    valid_classes = assign_ranks(valid_classes)
+
+    # Проход 4: дерево + уровни.
+    valid_classes, stats = build_tree(valid_classes)
+
+    # Сопоставляем классификации обратно к узлам.
+    cls_iter = iter(valid_classes)
+    scored: List[DocumentNode] = []
+    for node, c in zip(line_nodes, classifications):
+        if c is None or c.suppressed or c.rule is None or c.level is None:
+            # Абзац (подавлен S или не прошёл классификацию) — оставляем как есть.
+            node.text = strip_bold_markers(node.text)
+            scored.append(node)
+            continue
+        # Заголовок.
+        level = c.level
+        # Метаданные заголовка: rule, kind, rank, confidence.
+        meta = dict(node.metadata)
+        meta.pop("annotations", None)
+        meta["header_rule"] = c.rule
+        meta["header_kind"] = c.kind
+        meta["header_rank"] = c.rank
+        meta["header_confidence"] = c.confidence
+        meta["header_number"] = c.number
+        scored.append(
+            DocumentNode(
+                type="header",
+                level=level,
+                text=strip_bold_markers(node.text),
+                children=[],
+                metadata=meta,
+            )
+        )
+
+    merged = _merge_paragraphs(scored)
+    processed = DocumentNode(
+        type="document",
+        level=0,
+        text=root.text,
+        children=_rebuild(_flatten(DocumentNode(
+            type="document", level=0, text=root.text,
+            children=merged, metadata=dict(root.metadata),
+        ))),
+        metadata={**dict(root.metadata),
+                  "toc_suppressed": toc_suppressed,
+                  "priority_stats": stats},
+    )
+    return processed
+
+
 __all__ = [
     "BOLD_MARKERS",
     "CONTENT_WORDS",
@@ -1091,5 +1244,6 @@ __all__ = [
     "classify_header",
     "numbering_level",
     "promote_headers",
+    "promote_headers_priority",
     "strip_bold_markers",
 ]

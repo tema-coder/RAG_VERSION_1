@@ -60,9 +60,7 @@ class HybridRagChunker(BaseChunker):
 
     def __init__(
         self,
-        text_strategy: Literal[
-            "token", "sentence", "semantic", "recursive"
-        ] = "token",
+        text_strategy: Literal["token", "sentence", "semantic", "recursive"] = "token",
         chunk_size: Optional[int] = None,
         overlap: Optional[int] = None,
         source: str = "document",
@@ -117,6 +115,40 @@ class HybridRagChunker(BaseChunker):
             return self._chunk_with_tree(text, metadata, tree)
         return self._chunk_markdown(text, metadata)
 
+    def chunk_architectural(
+        self,
+        parsed_document,
+        document_version: int = 1,
+    ):
+        """Архитектурный чанкинг BEAR для гибридного чанкера.
+
+        НОВЫЙ метод — НЕ заменяет ``.chunk()`` (старая сигнатура с
+        ``tree=`` остаётся для API, ``process_input_folder`` и тестов).
+
+        Согласно Шагу 5 промпта, внутренние чанки получаем передачей
+        ``parsed_document.text`` (markdown) в старую логику ``.chunk()``
+        — без ``tree=``. Breadcrumb при этом восстанавливается из
+        markdown ``#``-заголовков (метод ``_chunk_markdown``), что даёт
+        корректные ``text_for_embedding`` и ``parent_id`` для маппинга.
+
+        Затем каждый внутренний чанк маппится в архитектурный через
+        ``map_internal_to_architectural_chunk`` с глобальным ``sequence``.
+        """
+        from rag_parser.chunkers.chunk_mapper import (
+            map_internal_to_architectural_chunk,
+        )
+
+        internal_chunks = self.chunk(parsed_document.text, {"source": "document"})
+        return [
+            map_internal_to_architectural_chunk(
+                internal_chunk=chunk,
+                document_id=parsed_document.document_id,
+                document_version=document_version,
+                sequence=i,
+            )
+            for i, chunk in enumerate(internal_chunks)
+        ]
+
     # ------------------------------------------------------------------
     # Tree path (primary): segments in document order with exact crumbs.
     # ------------------------------------------------------------------
@@ -149,7 +181,11 @@ class HybridRagChunker(BaseChunker):
                     # первый чанк этого родителя.
                     segments.append(("text", title, crumb, header_id))
                     # Уровень узла задаёт вложенность: снимаем более глубокие.
-                    level = node.level if isinstance(node.level, int) else len(header_stack) + 1
+                    level = (
+                        node.level
+                        if isinstance(node.level, int)
+                        else len(header_stack) + 1
+                    )
                     while header_stack and header_stack[-1][1] >= level:
                         header_stack.pop()
                     header_stack.append((header_id, level))
@@ -166,7 +202,9 @@ class HybridRagChunker(BaseChunker):
                     )
             else:  # paragraph / list_item / raw_text
                 if (node.text or "").strip():
-                    segments.append(("text", node.text.strip(), crumb, current_parent()))
+                    segments.append(
+                        ("text", node.text.strip(), crumb, current_parent())
+                    )
                 for child in node.children:
                     visit(child, trail)
 
@@ -188,12 +226,22 @@ class HybridRagChunker(BaseChunker):
             before = len(chunks)
             if kind == "table":
                 self._emit_table(
-                    segment_text, source, extra, chunks, crumb, parent_id,
+                    segment_text,
+                    source,
+                    extra,
+                    chunks,
+                    crumb,
+                    parent_id,
                     orders.get(parent_id, 0) if parent_id is not None else 0,
                 )
             else:
                 self._emit_text(
-                    segment_text, source, extra, chunks, crumb, parent_id,
+                    segment_text,
+                    source,
+                    extra,
+                    chunks,
+                    crumb,
+                    parent_id,
                     orders.get(parent_id, 0) if parent_id is not None else 0,
                 )
             if parent_id is not None:
@@ -234,9 +282,12 @@ class HybridRagChunker(BaseChunker):
             for line in block.splitlines():
                 match = HEADER_LINE_RE.match(line.strip())
                 if match:
-                    headers_in_block.append((len(match.group(1)), match.group(2).strip()))
+                    headers_in_block.append(
+                        (len(match.group(1)), match.group(2).strip())
+                    )
             if headers_in_block and not [
-                line for line in block.splitlines()
+                line
+                for line in block.splitlines()
                 if line.strip() and not HEADER_LINE_RE.match(line.strip())
             ]:
                 # Блок только из заголовков: чанки — с крошкой предков.
@@ -251,8 +302,13 @@ class HybridRagChunker(BaseChunker):
                     parent_stack.append((header_id, level))
                     # Заголовок — первый чанк своего же раздела.
                     self._emit_text(
-                        header_text, source, extra, chunks, crumb,
-                        header_id, next_order(header_id),
+                        header_text,
+                        source,
+                        extra,
+                        chunks,
+                        crumb,
+                        header_id,
+                        next_order(header_id),
                     )
                 continue
             for level, header_text in headers_in_block:
@@ -268,13 +324,23 @@ class HybridRagChunker(BaseChunker):
                 before = len(chunks)
                 if kind == "table":
                     self._emit_table(
-                        part, source, extra, chunks, crumb,
-                        parent_id, orders.get(parent_id, 0) if parent_id else 0,
+                        part,
+                        source,
+                        extra,
+                        chunks,
+                        crumb,
+                        parent_id,
+                        orders.get(parent_id, 0) if parent_id else 0,
                     )
                 else:
                     self._emit_text(
-                        part, source, extra, chunks, crumb,
-                        parent_id, orders.get(parent_id, 0) if parent_id else 0,
+                        part,
+                        source,
+                        extra,
+                        chunks,
+                        crumb,
+                        parent_id,
+                        orders.get(parent_id, 0) if parent_id else 0,
                     )
                 next_order_after(parent_id, len(chunks) - before)
         return chunks
@@ -327,9 +393,7 @@ class HybridRagChunker(BaseChunker):
         chunk_order: int = 0,
     ) -> None:
         order = chunk_order
-        for text_chunk in self.text_chunker.chunk(
-            part, {"source": source, **extra}
-        ):
+        for text_chunk in self.text_chunker.chunk(part, {"source": source, **extra}):
             text_chunk.metadata["chunk_type"] = "text"
             text_chunk.metadata["chunk_index"] = len(chunks)
             text_chunk.index = len(chunks)
@@ -342,9 +406,7 @@ class HybridRagChunker(BaseChunker):
             order += 1
             if breadcrumb:
                 text_chunk.metadata["breadcrumb"] = breadcrumb
-                text_chunk.text_for_embedding = enrich_text(
-                    text_chunk.text, breadcrumb
-                )
+                text_chunk.text_for_embedding = enrich_text(text_chunk.text, breadcrumb)
             else:
                 text_chunk.text_for_embedding = None
             chunks.append(text_chunk)

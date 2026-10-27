@@ -16,6 +16,7 @@ from rag_parser.api.dependencies import (
     validate_upload,
 )
 from rag_parser.api.schemas import (
+    ArchitecturalChunkResponse,
     ChunkingType,
     ChunkResponse,
     ErrorResponse,
@@ -63,9 +64,7 @@ def _chunking_params(
     if overlap >= chunk_size:
         raise _error(400, "overlap must be smaller than chunk_size", "invalid_params")
     if chunk_size < 100 or chunk_size > 2000:
-        raise _error(
-            400, "chunk_size must be between 100 and 2000", "invalid_params"
-        )
+        raise _error(400, "chunk_size must be between 100 and 2000", "invalid_params")
     if overlap < 0 or overlap > 500:
         raise _error(400, "overlap must be between 0 and 500", "invalid_params")
     if not 0.0 < threshold < 1.0:
@@ -79,7 +78,10 @@ def _chunking_params(
     }
 
 
-def _result_to_response(result: ParseResult) -> ParseResponse:
+def _result_to_response(
+    result: ParseResult,
+    architectural_chunks: Optional[list] = None,
+) -> ParseResponse:
     chunks = None
     if result.chunks is not None:
         chunks = [
@@ -96,12 +98,32 @@ def _result_to_response(result: ParseResult) -> ParseResponse:
             )
             for chunk in result.chunks
         ]
+    # Архитектурные чанки BEAR (опционально). ``architectural_chunks`` —
+    # список ``entities.Chunk`` (dataclass), построенный в ``parse_document``
+    # через ``chunker.chunk_architectural``. Старое поле ``chunks`` не
+    # трогается — фронтенд, читающий его, продолжает работать.
+    arch_response: Optional[List[ArchitecturalChunkResponse]] = None
+    if architectural_chunks:
+        arch_response = [
+            ArchitecturalChunkResponse(
+                id=str(chunk.id),
+                document_id=str(chunk.document_id),
+                document_version=chunk.document_version,
+                sequence=chunk.sequence,
+                text=chunk.text,
+                token_count=chunk.token_count,
+                metadata=chunk.metadata,
+            )
+            for chunk in architectural_chunks
+        ]
     metadata = dict(result.metadata)
     tree = None
     if result.tree is not None:
         from rag_parser.parsers.dedoc_tree import truncate
 
-        tree = TreeNode(**truncate(result.tree, settings.TREE_TEXT_PREVIEW_LEN).to_dict())
+        tree = TreeNode(
+            **truncate(result.tree, settings.TREE_TEXT_PREVIEW_LEN).to_dict()
+        )
     return ParseResponse(
         document_id=result.document_id,
         filename=result.filename,
@@ -109,6 +131,7 @@ def _result_to_response(result: ParseResult) -> ParseResponse:
         pages=metadata.get("pages"),
         markdown=result.markdown,
         chunks=chunks,
+        architectural_chunks=arch_response,
         tree=tree,
         metadata=metadata,
     )
@@ -211,7 +234,26 @@ async def parse_document(
     finally:
         temp_path.unlink(missing_ok=True)
 
-    response = _result_to_response(result)
+    # Архитектурные чанки BEAR: маппим ParseResult -> ParsedDocument и
+    # прогоняем через chunk_architectural (новый метод, не ломает старый
+    # .chunk()). document_version=1 — версионирования в репозитории пока
+    # нет. Ошибки маппинга НЕ роняют endpoint: architectural_chunks —
+    # опциональное обогащение, старое поле chunks уже построено выше.
+    architectural_chunks = None
+    if chunker is not None:
+        try:
+            from rag_parser.parsers.result_mapper import (
+                map_parse_result_to_parsed_document,
+            )
+
+            parsed_document = map_parse_result_to_parsed_document(result)
+            architectural_chunks = chunker.chunk_architectural(
+                parsed_document, document_version=1
+            )
+        except Exception as exc:  # noqa: BLE001 - enrichment is optional
+            logger.warning("architectural_chunks_failed file=%s err=%s", filename, exc)
+
+    response = _result_to_response(result, architectural_chunks)
     from rag_parser.parsers.dedoc_tree import truncate as _truncate
 
     stored_tree = (

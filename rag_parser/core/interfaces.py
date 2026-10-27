@@ -1,7 +1,16 @@
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    # Forward-only импорт архитектурных сущностей BEAR — нужен только для
+    # type hints в ``BaseChunker.chunk_architectural``. Runtime-импорт
+    # делается лениво внутри метода, чтобы не тянуть ``core.entities``
+    # (и ``chunkers.chunk_mapper``) на уровень ``core.interfaces`` и не
+    # создавать циклический импорт.
+    from rag_parser.core.entities import Chunk as ArchitecturalChunk
+    from rag_parser.core.entities import ParsedDocument
 
 
 class DocumentError(Exception):
@@ -61,7 +70,9 @@ class DocumentNode:
     чанкинг работает по полным текстам, урезание — последний шаг.
     """
 
-    type: str  # "document" | "header" | "paragraph" | "list_item" | "table" | "raw_text"
+    type: (
+        str  # "document" | "header" | "paragraph" | "list_item" | "table" | "raw_text"
+    )
     level: int
     text: str
     children: List["DocumentNode"] = field(default_factory=list)
@@ -142,3 +153,40 @@ class BaseChunker(ABC):
     @abstractmethod
     def chunk(self, text: str, metadata: dict) -> List[Chunk]:
         raise NotImplementedError
+
+    def chunk_architectural(
+        self,
+        parsed_document: "ParsedDocument",
+        document_version: int = 1,
+    ) -> "List[ArchitecturalChunk]":
+        """Архитектурный чанкинг BEAR: ``ParsedDocument`` -> ``List[Chunk]``.
+
+        НОВЫЙ метод — НЕ заменяет старый ``.chunk()``. Старая сигнатура
+        ``chunk(self, text, metadata)`` остаётся нетронутой, все вызовы
+        (API, ``process_input_folder``, тесты) продолжают работать.
+
+        Default-реализация: делегирует в существующий ``.chunk()``
+        (передавая ``parsed_document.text`` — markdown, как требует Шаг 5
+        промпта), затем маппит каждый внутренний чанк в архитектурный
+        через ``map_internal_to_architectural_chunk`` с глобальным
+        ``sequence`` из ``enumerate``. Подклассы (например,
+        ``HybridRagChunker``) могут переопределить метод, но базовая
+        логика одинакова и переопределять не обязательно.
+
+        ``document_version`` — версия документа для Parent-Child retrieval
+        (по умолчанию 1; версионирования в репозитории пока нет).
+        """
+        from rag_parser.chunkers.chunk_mapper import (
+            map_internal_to_architectural_chunk,
+        )
+
+        internal_chunks = self.chunk(parsed_document.text, {"source": "document"})
+        return [
+            map_internal_to_architectural_chunk(
+                internal_chunk=chunk,
+                document_id=parsed_document.document_id,
+                document_version=document_version,
+                sequence=i,
+            )
+            for i, chunk in enumerate(internal_chunks)
+        ]

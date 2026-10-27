@@ -52,7 +52,27 @@ class Settings(BaseSettings):
     # тогда как маршрут через pdf2docx даёт 37 заголовков и 9 таблиц —
     # структура документа сохраняется, см. README, «Ограничения PDF».
     # Цена: конвертер склеивает слова без пробелов и теряет часть титула.
+    #
+    # LEGACY: новый PDF-пайплайн (pdf_pipeline.py, маршрутизация
+    # текст/скан/таблицы через Docling) включается флагом USE_PDF_PIPELINE.
+    # При ``USE_PDF_PIPELINE=True`` (default) ``PDF_VIA_DOCX`` игнорируется.
     PDF_VIA_DOCX: bool = True
+
+    # --- Новый PDF-пайплайн (промпт promt_for_parse_pdf.txt) ---
+    # Включает маршрутизацию: текстовый PDF → Код №1 + Docling (таблицы),
+    # скан → Docling OCR. При False — старый путь (pdf_via_docx / dedoc).
+    USE_PDF_PIPELINE: bool = True
+    # Минимальное число осмысленных символов на странице, чтобы считать
+    # её «текстовой» (старт 50 — подтверждено на gost_report.pdf).
+    PDF_TEXT_MIN_CHARS_PER_PAGE: int = 50
+    # Минимальная доля текстовых страниц, чтобы считать документ текстовым
+    # (старт 0.5 — если хотя бы половина страниц с текстом, не скан).
+    PDF_TEXT_PAGES_MIN_RATIO: float = 0.5
+    # Детектор таблиц: "pymupdf" (default) или "pdfplumber".
+    PDF_TABLE_DETECTOR: str = "pymupdf"
+    # Docling OCR-движок и языки.
+    DOCLING_OCR_ENGINE: str = "easyocr"
+    DOCLING_OCR_LANGS: str = "ru,en"  # comma-separated
 
     model_config = SettingsConfigDict(
         env_file=".env",

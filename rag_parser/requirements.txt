@@ -1,25 +1,141 @@
-dedoc==2.8
-streamlit==1.38.0
+# dedoc==2.8
+# streamlit==1.38.0
+# fastapi==0.104.1
+# uvicorn[standard]==0.23.2
+# python-multipart==0.0.6
+# pydantic>=2.5.3,<3
+# pydantic-settings>=2.0
+# tiktoken==0.7.0
+# chonkie==1.3.1
+# sentence-transformers>=3.0
+# tqdm 
+# aiofiles==24.1.0
+# httpx==0.27.2
+# pytest==8.3.3
+# pytest-asyncio==0.24.0
+# pytest-cov 
+# structlog==24.4.0
+# python-dotenv==1.0.1
+# python-magic==0.4.27
+# orjson==3.10.7
+# openpyxl 
+# python-docx==0.8.11
+# xlwt
+# pdf2docx==0.5.13
+# mistune==3.1.3
+
+
+
+# ============================================================
+# torch ставится ОТДЕЛЬНО и ПЕРВЫМ, CPU-сборка.
+# НЕ помещайте --index-url в requirements.txt — он применяется глобально
+# и ломает скачивание остальных пакетов с PyPI.
+# Установка torch:
+torch>=2.1.0,<3 --index-url https://download.pytorch.org/whl/cpu
+# После этого:
+#   pip install -r requirements.txt
+
+
+
+# Зависимости dedoc (при --no-deps не тянутся автоматически):
+imutils
+rtree
+pdf.tocgen
+piexif
+puremagic
+rarfile
+py7zr
+wget
+beautifulsoup4==4.12.3
+pdfminer.six
+pdf2image
+pypdf
+pypdfium2
+pytesseract
+xgboost
+xlrd==1.2.0
+roman
+levenshtein
+texttable
+fonttools
+olefile
+charset-normalizer
+itsdangerous
+starlette
+ujson
+scikit-image
+scikit-learn
+scipy
+six
+pandas
+# pdf4llm - ВОТ С НИМ НАДО ОПРЕДЕЛИТСЯ БРАТЬ НЕ БРАТЬ
+# ============================================================
+# Docling — PDF → Markdown (новый PDF-пайплайн)
+# ============================================================
+docling>=2.5.0
+
+# ============================================================
+# PyMuPDF — Код №1, классификатор, детектор таблиц
+# ============================================================
+PyMuPDF==1.26.7
+
+# Альтернативный детектор таблиц (опция, PDF_TABLE_DETECTOR=pdfplumber)
+pdfplumber>=0.11.0
+
+
+
+# ============================================================
+# Markdown / HTML препроцессоры
+# ============================================================
+mistune==3.1.3
+
+# ============================================================
+# Web-фреймворк
+# ============================================================
 fastapi==0.104.1
 uvicorn[standard]==0.23.2
 python-multipart==0.0.6
+
+# ============================================================
+# Pydantic / настройки
+# ============================================================
 pydantic>=2.5.3,<3
 pydantic-settings>=2.0
+
+# ============================================================
+# Чанкинг и токенизация
+# ============================================================
 tiktoken==0.7.0
 chonkie==1.3.1
 sentence-transformers>=3.0
-tqdm 
-aiofiles==24.1.0
-httpx==0.27.2
-pytest==8.3.3
-pytest-asyncio==0.24.0
-pytest-cov 
+
+# ============================================================
+# Логирование, конфиг, сериализация
+# ============================================================
 structlog==24.4.0
 python-dotenv==1.0.1
-python-magic==0.4.27
 orjson==3.10.7
-openpyxl 
-python-docx==0.8.11
+python-magic==0.4.27
+aiofiles==24.1.0
+httpx>=0.28.0,<1.0.0
+tqdm
+
+# ============================================================
+# Офисные форматы
+# ============================================================
+python-docx>=1.1.2,<2.0.0
+
+openpyxl>=3.1.0
 xlwt
-pdf2docx==0.5.13
-mistune==3.1.3
+
+# ============================================================
+# Тесты
+# ============================================================
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov
+
+# ============================================================
+# UI (Streamlit frontend)
+# ============================================================
+streamlit==1.38.0
