@@ -29,7 +29,6 @@ from rag_parser.core.interfaces import (
     DocumentError,
     DocumentParseError,
     FileTooLargeError,
-    OcrDisabledError,
     ParseResult,
     UnsupportedFormatError,
 )
@@ -64,7 +63,9 @@ def _chunking_params(
     if overlap >= chunk_size:
         raise _error(400, "overlap must be smaller than chunk_size", "invalid_params")
     if chunk_size < 100 or chunk_size > 2000:
-        raise _error(400, "chunk_size must be between 100 and 2000", "invalid_params")
+        raise _error(
+            400, "chunk_size must be between 100 and 2000", "invalid_params"
+        )
     if overlap < 0 or overlap > 500:
         raise _error(400, "overlap must be between 0 and 500", "invalid_params")
     if not 0.0 < threshold < 1.0:
@@ -121,9 +122,7 @@ def _result_to_response(
     if result.tree is not None:
         from rag_parser.parsers.dedoc_tree import truncate
 
-        tree = TreeNode(
-            **truncate(result.tree, settings.TREE_TEXT_PREVIEW_LEN).to_dict()
-        )
+        tree = TreeNode(**truncate(result.tree, settings.TREE_TEXT_PREVIEW_LEN).to_dict())
     return ParseResponse(
         document_id=result.document_id,
         filename=result.filename,
@@ -220,10 +219,6 @@ async def parse_document(
                 )
     except UnsupportedFormatError as exc:
         raise _error(422, exc.message, "unsupported_format") from exc
-    except OcrDisabledError as exc:
-        # ВАЖНО: ловим ДО DocumentParseError — подтип наследует его, иначе
-        # осознанный отказ «OCR отключён» уехал бы в общий 400.
-        raise _error(422, exc.message, "ocr_disabled") from exc
     except DocumentParseError as exc:
         raise _error(400, exc.message, "parse_error") from exc
     except ValueError as exc:
@@ -251,7 +246,9 @@ async def parse_document(
                 parsed_document, document_version=1
             )
         except Exception as exc:  # noqa: BLE001 - enrichment is optional
-            logger.warning("architectural_chunks_failed file=%s err=%s", filename, exc)
+            logger.warning(
+                "architectural_chunks_failed file=%s err=%s", filename, exc
+            )
 
     response = _result_to_response(result, architectural_chunks)
     from rag_parser.parsers.dedoc_tree import truncate as _truncate

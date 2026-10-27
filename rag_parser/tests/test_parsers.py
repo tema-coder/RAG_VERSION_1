@@ -9,7 +9,6 @@ import pytest
 from rag_parser.core.config import settings
 from rag_parser.core.interfaces import (
     DocumentParseError,
-    OcrDisabledError,
     UnsupportedFormatError,
 )
 from rag_parser.parsers.dedoc_parser import (
@@ -63,10 +62,10 @@ class TestSupported:
 
         assert set(LIBREOFFICE_EXTENSIONS) == {".doc", ".odt", ".rtf"}
 
-    def test_parameters_pdf(self, tmp_path):
-        params = parameters_for_format(".pdf", tmp_path / "a.pdf")
-        assert params["pdf_with_text_layer"] == "true"
-        assert params["structure_type"] == "tree"
+    # test_parameters_pdf удалён: PDF больше не идёт через dedoc напрямую,
+    # параметры ``pdf_with_text_layer`` нет. PDF обрабатывается отдельным
+    # пайплайном (``_parse_pdf_via_pipeline``), тестируемым в
+    # ``test_pdf_pipeline.py``.
 
     def test_parameters_tsv(self, tmp_path):
         assert parameters_for_format(".tsv", tmp_path / "a.tsv")["delimiter"] == "\t"
@@ -173,9 +172,29 @@ class TestParseFormats:
         assert len(calls) == 1
         assert "row-0" in result.markdown
 
-    def test_pdf_text(self, parser, pdf_files):
+    def test_pdf_text(self, parser, pdf_files, monkeypatch):
+        # PDF идёт через pdf_pipeline. Docling не установлен в тестовом
+        # окружении — мокаем run_pipeline. Реальный разбор PDF тестируется
+        # в ``test_pdf_pipeline.py``.
+        from rag_parser.parsers import pdf_pipeline
+        from rag_parser.parsers.pdf_pipeline import PdfPipelineResult
+
+        def _mock(path, **kwargs):
+            return PdfPipelineResult(
+                markdown="PDF pipeline mocked for test_pdf_text.",
+                metadata={"source_pipeline": "pdf_router", "pdf_type": "text",
+                          "total_pages": 1, "text_pages": [0], "scan_pages": [],
+                          "routing": {"text_parser_pages": [0], "docling_pages": [],
+                                      "docling_ocr_pages": [], "table_runs": []},
+                          "docling_runs": [], "lost_tables": [], "timings": {},
+                          "format": "dedoc", "extension": ".pdf",
+                          "size_bytes": 100, "parser": "pdf_pipeline"},
+            )
+
+        monkeypatch.setattr(pdf_pipeline, "run_pipeline", _mock)
         result = parser.parse(pdf_files["pdf_text"])
-        assert "First page of the document." in result.markdown
+        assert result.markdown.strip()
+        assert result.metadata["parser"] == "pdf_pipeline"
 
     def test_header_recognition_is_deterministic(
         self, header_docs, tmp_path, monkeypatch
@@ -306,19 +325,6 @@ class TestErrors:
         path.write_bytes(b"fake")
         with pytest.raises(UnsupportedFormatError):
             parser.parse(path)
-
-    def test_pdf_without_text_layer(self, parser, tmp_path):
-        path = _build_pdf([[]], None, tmp_path / "empty_page.pdf")
-        with pytest.raises(OcrDisabledError, match="текстового слоя"):
-            parser.parse(path)
-
-    def test_ocr_disabled_is_document_parse_error(self):
-        """Подтип сохраняет совместимость с общим обработчиком 400."""
-        assert issubclass(OcrDisabledError, DocumentParseError)
-        error = OcrDisabledError(filename="scan.pdf")
-        assert error.message == OcrDisabledError.MESSAGE
-        assert "OCR отключён" in error.message
-        assert error.filename == "scan.pdf"
 
 
 class TestNewFormats:

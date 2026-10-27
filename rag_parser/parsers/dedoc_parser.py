@@ -16,9 +16,9 @@
 * ``.md`` — ``markdown_preprocessor`` рендерит markdown в HTML через
   ``mistune`` (dedoc markdown не знает, а откат на ``text/plain`` —
   недокументированное поведение, и оно молча ломает разбор при смене версии);
-* ``.pdf`` — по умолчанию идёт через ``pdf2docx`` в DOCX (см.
-  ``PDF_VIA_DOCX`` и ``parsers/pdf_via_docx.py``): нативный PDF-ридер теряет
-  структуру и таблицы;
+* ``.pdf`` — обрабатывается отдельным пайплайном (``_parse_pdf_via_pipeline``):
+  классификация → маршрутизация (Код №1 / Docling) → сборка Markdown →
+  существующий ``.md``-маршрут. dedoc больше не читает PDF напрямую;
 * ``.xls`` — конвертируется в ``.xlsx`` через ``xlrd``+``openpyxl``,
   чтобы не зависеть от LibreOffice на legacy-файлах.
 
@@ -39,7 +39,6 @@ from rag_parser.core.config import settings
 from rag_parser.core.interfaces import (
     BaseParser,
     DocumentParseError,
-    OcrDisabledError,
     ParseResult,
     UnsupportedFormatError,
 )
@@ -90,11 +89,12 @@ _manager: Any = None
 
 
 def build_manager() -> Any:
-    """DedocManager с урезанным конфигом (без OCR/GPU-ридеров).
+    """DedocManager с урезанным конфигом (без OCR/GPU-ридеров и без PDF).
 
-    Ридеры: DOCX, Excel, TXT, CSV/TSV, HTML, PDF только с текстовым слоем
-    (``PdfTxtlayerReader``/``PdfTabbyReader``/``PdfBrokenEncodingReader`` —
-    без ``PdfAutoReader``/``PdfImageReader``, тянущих torchvision и OCR).
+    Ридеры: DOCX, Excel, TXT, CSV/TSV, HTML. PDF больше не читается dedoc-ом
+    напрямую — для PDF используется отдельный пайплайн
+    (``_parse_pdf_via_pipeline``, классификация + Docling), а dedoc
+    разбирает уже собранный Markdown через ``.md``-маршрут.
     """
     from dedoc import DedocManager
     from dedoc.attachments_handler import AttachmentsHandler
@@ -102,28 +102,17 @@ def build_manager() -> Any:
     from dedoc.converters import ConverterComposition
     from dedoc.converters.concrete_converters.docx_converter import DocxConverter
     from dedoc.converters.concrete_converters.excel_converter import ExcelConverter
-    from dedoc.converters.concrete_converters.pdf_converter import PDFConverter
     from dedoc.converters.concrete_converters.txt_converter import TxtConverter
     from dedoc.metadata_extractors import MetadataExtractorComposition
     from dedoc.metadata_extractors.concrete_metadata_extractors import (
         base_metadata_extractor,
         docx_metadata_extractor,
-        pdf_metadata_extractor,
     )
     from dedoc.readers import ReaderComposition
     from dedoc.readers.csv_reader.csv_reader import CSVReader
     from dedoc.readers.docx_reader.docx_reader import DocxReader
     from dedoc.readers.excel_reader.excel_reader import ExcelReader
     from dedoc.readers.html_reader.html_reader import HtmlReader
-    from dedoc.readers.pdf_reader.pdf_txtlayer_reader.pdf_broken_encoding_reader import (
-        PdfBrokenEncodingReader,
-    )
-    from dedoc.readers.pdf_reader.pdf_txtlayer_reader.pdf_tabby_reader import (
-        PdfTabbyReader,
-    )
-    from dedoc.readers.pdf_reader.pdf_txtlayer_reader.pdf_txtlayer_reader import (
-        PdfTxtlayerReader,
-    )
     from dedoc.readers.txt_reader.raw_text_reader import RawTextReader
     from dedoc.structure_constructors import StructureConstructorComposition
     from dedoc.structure_constructors.concrete_structure_constructors import (
@@ -145,7 +134,6 @@ def build_manager() -> Any:
                     DocxConverter(config=config),
                     ExcelConverter(config=config),
                     TxtConverter(config=config),
-                    PDFConverter(config=config),
                 ]
             ),
             "reader": ReaderComposition(
@@ -155,9 +143,6 @@ def build_manager() -> Any:
                     RawTextReader(config=config),
                     CSVReader(config=config),
                     HtmlReader(config=config),
-                    PdfTxtlayerReader(config=config),
-                    PdfTabbyReader(config=config),
-                    PdfBrokenEncodingReader(config=config),
                 ]
             ),
             "structure_extractor": StructureExtractorComposition(
@@ -179,7 +164,6 @@ def build_manager() -> Any:
             "document_metadata_extractor": MetadataExtractorComposition(
                 extractors=[
                     docx_metadata_extractor.DocxMetadataExtractor(config=config),
-                    pdf_metadata_extractor.PdfMetadataExtractor(config=config),
                     base_metadata_extractor.BaseMetadataExtractor(config=config),
                 ]
             ),
@@ -200,17 +184,10 @@ def get_manager() -> Any:
 def prepare_manager_for_format(extension: str) -> Any:
     """Возвращает менеджер, готовый к разбору указанного формата.
 
-    Для PDF дополнительно ставится защита bbox: dedoc 2.8 роняет разбор
-    страниц, у которых координаты текста выходят за границы рендера
-    (см. ``parsers.pdf_bbox_guard``). Для остальных форматов менеджер
-    возвращается как есть.
+    PDF больше не доходит до dedoc (обрабатывается отдельным пайплайном
+    ``_parse_pdf_via_pipeline``), поэтому bbox-защита не нужна.
     """
-    manager = get_manager()
-    if str(extension).lower() == ".pdf":
-        from rag_parser.parsers.pdf_bbox_guard import install_bbox_guard
-
-        install_bbox_guard()
-    return manager
+    return get_manager()
 
 
 def libreoffice_available() -> bool:
@@ -265,6 +242,7 @@ def prepare_for_parsing(path: Path) -> PreparedInput:
     extension = path.suffix.lower()
 
     if extension in (".html", ".htm", ".md", ".xml", ".txt"):
+
         if extension == ".md":
             from rag_parser.parsers.markdown_preprocessor import (
                 prepare_markdown_for_dedoc,
@@ -319,6 +297,7 @@ def prepare_for_parsing(path: Path) -> PreparedInput:
     if alias is None:
         return PreparedInput(path, extension, None, [])
 
+
     target_dir = settings.ensure_temp_dir()
     alias_path = target_dir / f"{path.stem}{alias}"
     shutil.copyfile(path, alias_path)
@@ -366,8 +345,6 @@ def parameters_for_format(extension: str, file_path: Path) -> Dict[str, str]:
         # и наш xml/txt-препроцессоры его не проставляют). Таблица не
         # просто остаётся нераспознанной — она исчезает из вывода.
         params["handle_invisible_table"] = "true"
-    if extension == ".pdf":
-        params["pdf_with_text_layer"] = "true"
     if extension in (".csv", ".tsv"):
         from rag_parser.parsers.base import detect_dialect
 
@@ -466,7 +443,6 @@ class DedocParser(BaseParser):
     def parse(self, file_path: Path) -> ParseResult:
         from rag_parser.parsers.dedoc_tree import (
             build_full_tree,
-            drop_header_only_tables,
             full_tree_to_markdown,
             normalize_markup_levels,
             reattach_tables,
@@ -491,11 +467,10 @@ class DedocParser(BaseParser):
             raise UnsupportedFormatError(extension, SUPPORTED_EXTENSIONS)
 
         # --- Новый PDF-пайплайн (промпт promt_for_parse_pdf.txt) ---
-        # PDF → classify → route (text_parser / docling / docling_ocr) →
-        # assemble Markdown → существующий .md-путь (mistune → HTML →
-        # HtmlReader → header_promoter → chunking). Docling больше не
-        # читает PDF напрямую.
-        if extension == ".pdf" and settings.USE_PDF_PIPELINE:
+        # PDF ВСЕГДА через отдельный пайплайн (classify → route → Docling →
+        # assemble Markdown → .md-путь). Прямой dedoc-парсинг PDF и маршрут
+        # через pdf2docx удалены.
+        if extension == ".pdf":
             return self._parse_pdf_via_pipeline(path, size_bytes)
 
         self._validate_container(path, extension)
@@ -512,16 +487,6 @@ class DedocParser(BaseParser):
             converted = convert_xls_to_xlsx(path)
             effective_path = converted
             effective_extension = ".xlsx"
-        elif extension == ".pdf" and settings.PDF_VIA_DOCX:
-            # Опциональный маршрут PDF -> DOCX (за флагом PDF_VIA_DOCX).
-            # Конвертер искажает структуру, поэтому включать только осознанно;
-            # см. README, «Ограничения PDF», и scripts/debug_pdf_via_docx.py.
-            from rag_parser.parsers.pdf_via_docx import convert_pdf_to_docx
-
-            converted = convert_pdf_to_docx(path, settings.ensure_temp_dir())
-            if converted is not None:
-                effective_path = converted
-                effective_extension = ".docx"
         else:
             prepared = prepare_for_parsing(path)
             effective_path = prepared.path
@@ -558,14 +523,8 @@ class DedocParser(BaseParser):
 
         content = tree.get("content", {}) or {}
         tables = content.get("tables") or []
-        if converted is not None and extension not in (".xlsx", ".xls"):
-            # Файл шёл через конвертацию (doc/odt/rtf -> docx, pdf -> docx).
-            # Конвертер дробит таблицы по границам страниц и оставляет куски
-            # из одной шапки; в исходном документе таких таблиц нет, поэтому
-            # отбрасываем их до привязки, а не после (см.
-            # dedoc_tree.drop_header_only_tables).
-            tables = drop_header_only_tables(tables)
-            content["tables"] = tables
+        # PDF больше не доходит сюда (обрабатывается в _parse_pdf_via_pipeline),
+        # поэтому drop_header_only_tables (костыль для pdf2docx) не нужен.
         if extension in (".xlsx", ".xls"):
             # Точная заливка по диапазонам книги (для xls — по
             # сконвертированному файлу с перенесёнными мёрджами);
@@ -610,10 +569,6 @@ class DedocParser(BaseParser):
         markdown = full_tree_to_markdown(full_root)
 
         if not markdown.strip():
-            if extension == ".pdf":
-                # Отдельный подтип: OCR отключён по условиям задачи, это
-                # осознанный отказ (HTTP 422), а не сбой разбора (400).
-                raise OcrDisabledError(filename=path.name)
             raise DocumentParseError(
                 "Converted document contains no text", filename=path.name
             )
@@ -654,6 +609,10 @@ class DedocParser(BaseParser):
         """
         from rag_parser.parsers.docling_converter import DoclingError
         from rag_parser.parsers.pdf_pipeline import run_pipeline
+
+        # Валидация контейнера: файл должен быть настоящим PDF (%PDF-),
+        # иначе пайплайн упадёт невнятной ошибкой PyMuPDF.
+        self._validate_container(path, ".pdf")
 
         ocr_langs = tuple(settings.DOCLING_OCR_LANGS.split(","))
         try:
@@ -719,7 +678,6 @@ class DedocParser(BaseParser):
         reattach_tables(full_root, tables)
         if html_tables:
             from rag_parser.parsers.dedoc_tree import attach_tables_by_position
-
             attach_tables_by_position(full_root, html_tables)
 
         final_markdown = full_tree_to_markdown(full_root)

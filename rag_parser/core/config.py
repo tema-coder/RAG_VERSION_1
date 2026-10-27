@@ -46,22 +46,12 @@ class Settings(BaseSettings):
     # 0 или меньше отключает ограничение (весь путь) — для отладки.
     BREADCRUMB_MAX_DEPTH: int = 2
     TREE_TEXT_PREVIEW_LEN: int = 30
-    # PDF → DOCX через pdf2docx перед разбором. ВКЛЮЧЕНО по умолчанию:
-    # нативный PdfTxtlayerReader на gost_report.pdf даёт 218 «заголовков»
-    # (числа в ячейках таблиц, повышенные header_promoter) и 0 таблиц,
-    # тогда как маршрут через pdf2docx даёт 37 заголовков и 9 таблиц —
-    # структура документа сохраняется, см. README, «Ограничения PDF».
-    # Цена: конвертер склеивает слова без пробелов и теряет часть титула.
-    #
-    # LEGACY: новый PDF-пайплайн (pdf_pipeline.py, маршрутизация
-    # текст/скан/таблицы через Docling) включается флагом USE_PDF_PIPELINE.
-    # При ``USE_PDF_PIPELINE=True`` (default) ``PDF_VIA_DOCX`` игнорируется.
-    PDF_VIA_DOCX: bool = True
 
-    # --- Новый PDF-пайплайн (промпт promt_for_parse_pdf.txt) ---
-    # Включает маршрутизацию: текстовый PDF → Код №1 + Docling (таблицы),
-    # скан → Docling OCR. При False — старый путь (pdf_via_docx / dedoc).
-    USE_PDF_PIPELINE: bool = True
+    # --- PDF-пайплайн (промпт promt_for_parse_pdf.txt) ---
+    # Единый маршрут PDF: классификация (text/scan) → маршрутизация
+    # (Код №1 / Docling без OCR / Docling OCR) → сборка Markdown →
+    # существующий .md-путь. Старые маршруты (pdf2docx, прямой dedoc PDF)
+    # удалены.
     # Минимальное число осмысленных символов на странице, чтобы считать
     # её «текстовой» (старт 50 — подтверждено на gost_report.pdf).
     PDF_TEXT_MIN_CHARS_PER_PAGE: int = 50
