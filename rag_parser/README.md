@@ -55,13 +55,12 @@ breadcrumb-обогащением чанков, Child-Parent развёртко�
 python3.10 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install --no-deps dedoc==2.8
-pip install dedoc-utils==0.3.11
-# 2. Установка torch CPU отдельно (чтобы не тянуть CUDA ~1.2 ГБ)
-
-
-
-# 4. Установка остального стека
 pip install -r rag_parser/requirements.txt
+
+pip install dedoc-utils==0.3.11
+
+
+
 
 # 5. Системная зависимость для .doc/.odt/.rtf
 sudo apt-get install libreoffice-writer libreoffice-calc
