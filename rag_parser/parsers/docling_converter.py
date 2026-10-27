@@ -52,62 +52,106 @@ def is_docling_available() -> bool:
     if _docling_available is None:
         try:
             from docling.document_converter import DocumentConverter  # noqa: F401
-
             _docling_available = True
         except ImportError:
             _docling_available = False
     return _docling_available
 
 
-def _build_converter(
-    *,
-    with_ocr: bool,
-    ocr_engine: str = "easyocr",
-    ocr_langs: Sequence[str] = ("ru", "en"),
-) -> Any:
+def _build_converter(*, with_ocr: bool, ocr_engine: str = "easyocr",
+                     ocr_langs: Sequence[str] = ("ru", "en")) -> Any:
     """Создаёт ``DocumentConverter`` с нужным профилем.
 
     Lazy import — модели загружаются только при первом реальном вызове.
     В юнит-тестах эта функция не вызывается (Docling мокается).
+
+    API Docling (v2.50+): ``DocumentConverter(format_options={InputFormat.PDF:
+    PdfFormatOption(pipeline_options=PdfPipelineOptions(...))})``.
+
+    ``ocr_options`` — конкретный dataclass (``EasyOcrOptions`` /
+    ``TesseractOcrOptions`` / …), НЕ dict. У каждого свой ``kind``
+    (ClassVar), по нему Docling находит класс движка. Передача dict без
+    ``kind`` → ``No class found with the name ''``.
+
+    ``force_full_page_ocr`` deprecated — вместо него ``OcrMode.FULL_PAGE``
+    в ``ocr_options.mode``.
     """
-    from docling.document_converter import DocumentConverter
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
+        OcrMode,
         PdfPipelineOptions,
         TableStructureOptions,
     )
 
     if with_ocr:
-        pipeline = PdfPipelineOptions(
+        ocr_options = _make_ocr_options(
+            ocr_engine=ocr_engine,
+            ocr_langs=list(ocr_langs),
+            full_page=True,
+        )
+        pipeline_options = PdfPipelineOptions(
             do_ocr=True,
             do_table_structure=True,
-            ocr_options={
-                "lang": list(ocr_langs),
-                "force_full_page_ocr": False,
-            },
+            ocr_options=ocr_options,
         )
     else:
-        pipeline = PdfPipelineOptions(
+        pipeline_options = PdfPipelineOptions(
             do_ocr=False,
             do_table_structure=True,
             table_structure_options=TableStructureOptions(do_cell_matching=True),
         )
 
-    return DocumentConverter(pipeline_options=pipeline)
+    pdf_option = PdfFormatOption(pipeline_options=pipeline_options)
+    return DocumentConverter(
+        format_options={InputFormat.PDF: pdf_option},
+    )
 
 
-def get_ocr_converter(
-    ocr_engine: str = "easyocr", ocr_langs: Sequence[str] = ("ru", "en")
-) -> Any:
+def _make_ocr_options(*, ocr_engine: str, ocr_langs: list, full_page: bool):
+    """Создаёт dataclass OCR-опций для выбранного движка.
+
+    Docling требует конкретный подкласс ``OcrOptions`` (с ``kind``) — dict
+    не принимается. Поддерживаемые движки: ``easyocr``, ``tesseract``,
+    ``tesserocr``, ``rapidocr``. Если движок недоступен — fallback на
+    ``easyocr`` (ставится через ``pip install docling[easyocr]``).
+    """
+    from docling.datamodel.pipeline_options import (
+        EasyOcrOptions,
+        OcrMode,
+        TesseractCliOcrOptions,
+        TesseractOcrOptions,
+    )
+    mode = OcrMode.FULL_PAGE if full_page else None
+    engine = (ocr_engine or "easyocr").lower()
+
+    if engine in ("easyocr", "easy_ocr"):
+        return EasyOcrOptions(lang=ocr_langs or ["en"], use_gpu=False,
+                              mode=mode)
+    if engine in ("tesseract",):
+        return TesseractCliOcrOptions(lang=ocr_langs or ["eng"], mode=mode)
+    if engine in ("tesserocr",):
+        return TesseractOcrOptions(lang=ocr_langs or ["eng"], mode=mode)
+    # rapidocr — опционально, импортируем лениво (не во всех версиях).
+    try:
+        from docling.datamodel.pipeline_options import RapidOcrOptions
+        if engine == "rapidocr":
+            return RapidOcrOptions(lang=ocr_langs or ["en"], mode=mode)
+    except ImportError:
+        pass
+    # Fallback — easyocr (самый распространённый, ставится через docling[easyocr]).
+    return EasyOcrOptions(lang=ocr_langs or ["en"], use_gpu=False, mode=mode)
+
+
+def get_ocr_converter(ocr_engine: str = "easyocr",
+                      ocr_langs: Sequence[str] = ("ru", "en")) -> Any:
     """Singleton OCR-конвертер (создаётся при первом вызове)."""
     global _ocr_converter
     if _ocr_converter is None:
-        logger.info(
-            "docling_ocr_converter_init",
-            extra={"ocr_engine": ocr_engine, "ocr_langs": list(ocr_langs)},
-        )
+        logger.info("docling_ocr_converter_init", extra={
+            "ocr_engine": ocr_engine, "ocr_langs": list(ocr_langs)})
         _ocr_converter = _build_converter(
-            with_ocr=True, ocr_engine=ocr_engine, ocr_langs=ocr_langs
-        )
+            with_ocr=True, ocr_engine=ocr_engine, ocr_langs=ocr_langs)
     return _ocr_converter
 
 
@@ -146,7 +190,6 @@ def _clean_docling_markdown(md: str) -> str:
 # --------------------------------------------------------------------------- #
 # Основной API
 # --------------------------------------------------------------------------- #
-
 
 @dataclass
 class DoclingResult:
@@ -188,21 +231,21 @@ def convert(
         else:
             converter = get_no_ocr_converter()
 
-        # Если передан диапазон страниц — создаём sub-PDF.
+        # Docling поддерживает page_range напрямую (0-based, inclusive).
+        # Если передан диапазон страниц — используем его, без sub-PDF.
         if pages is not None and len(pages) > 0:
-            sub_path = _create_sub_pdf(path, pages)
-            try:
-                conv_doc = converter.convert(sub_path)
-                md = conv_doc.document.export_to_markdown()
-            finally:
-                sub_path.unlink(missing_ok=True)
-            page_range = (min(pages), max(pages))
+            sorted_pages = sorted(set(pages))
+            page_range_tuple = (sorted_pages[0], sorted_pages[-1])
+            conv_doc = converter.convert(
+                str(path), page_range=page_range_tuple
+            )
+            md = conv_doc.document.export_to_markdown()
+            page_range = page_range_tuple
         else:
             conv_doc = converter.convert(str(path))
             md = conv_doc.document.export_to_markdown()
             # Весь файл — диапазон (0, total-1).
             import fitz
-
             doc = fitz.open(str(path))
             page_range = (0, len(doc) - 1)
             doc.close()
