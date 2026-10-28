@@ -47,22 +47,35 @@ class Settings(BaseSettings):
     BREADCRUMB_MAX_DEPTH: int = 2
     TREE_TEXT_PREVIEW_LEN: int = 30
 
-    # --- PDF-пайплайн (промпт promt_for_parse_pdf.txt) ---
+    # --- PDF-пайплайн (ТЗ promt_for_agent.txt) ---
     # Единый маршрут PDF: классификация (text/scan) → маршрутизация
-    # (Код №1 / Docling без OCR / Docling OCR) → сборка Markdown →
-    # существующий .md-путь. Старые маршруты (pdf2docx, прямой dedoc PDF)
-    # удалены.
+    # (без таблиц → PyMuPDF; с таблицами / скан → layout + EasyOCR +
+    # TableFormer) → склейка по порядку страниц → существующий .md-путь.
     # Минимальное число осмысленных символов на странице, чтобы считать
     # её «текстовой» (старт 50 — подтверждено на gost_report.pdf).
     PDF_TEXT_MIN_CHARS_PER_PAGE: int = 50
+    # Минимальная доля площади текста от площади страницы (отсев страниц
+    # с одним колонтитулом/номером ~0.0004; титульная строка — ~0.005).
+    PDF_TEXT_MIN_AREA_RATIO: float = 0.002
+    # Минимальная доля «читаемых» символов (кириллица/латиница/цифры/
+    # стандартная пунктуация) — отсев мусорного текстового слоя
+    # (кракозябры, битый OCR-слой, (cid:…) и т.п.).
+    PDF_TEXT_MIN_VALID_CHAR_RATIO: float = 0.7
     # Минимальная доля текстовых страниц, чтобы считать документ текстовым
     # (старт 0.5 — если хотя бы половина страниц с текстом, не скан).
     PDF_TEXT_PAGES_MIN_RATIO: float = 0.5
-    # Детектор таблиц: "pymupdf" (default) или "pdfplumber".
+    # Способ детекции таблиц: "pymupdf" (find_tables, default),
+    # "docling_layout" (блоки Table от layout-модели), "auto" (оба).
     PDF_TABLE_DETECTOR: str = "pymupdf"
-    # Docling OCR-движок и языки.
+    # Layout-модель: "docling" (если установлен) или "pymupdf"
+    # (эвристическая сегментация по блокам PyMuPDF).
+    PDF_LAYOUT_BACKEND: str = "auto"
+    # Разрешение рендера страницы в изображение (DPI) для layout/OCR.
+    PDF_RENDER_DPI: int = 200
+    # OCR-движок и языки (EasyOCR; comma-separated в .env).
     DOCLING_OCR_ENGINE: str = "easyocr"
-    DOCLING_OCR_LANGS: str = "ru,en"  # comma-separated
+    DOCLING_OCR_LANGS: str = "ru,en"
+    EASYOCR_LANGS: str = "ru,en"  # comma-separated
 
     model_config = SettingsConfigDict(
         env_file=".env",

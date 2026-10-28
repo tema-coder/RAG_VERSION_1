@@ -18,6 +18,8 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
+from pathlib import Path
+from rag_parser.core.config import PACKAGE_ROOT as _PKG_ROOT
 
 from rag_parser.parsers.priority_rules import (
     CONFIDENCE_CHAIN,
@@ -379,6 +381,20 @@ class TestGostReportRegression:
     считал их заголовками по старому правилу 7 (нумерация).
     """
 
+    @staticmethod
+    def _gost_report_path() -> Path:
+        """Путь к gost_report.docx в проекте (проверяется перед прогоном).
+
+        Раньше путь был захардкожен как
+        ``/home/z/my-project/upload/gost_report.docx`` (машина автора) —
+        на любом другом окружении тест падал с ``FileNotFoundError``
+        вместо внятного skip.
+        """
+        candidate = _PKG_ROOT.parent / "input" / "gost_report.docx"
+        if candidate.exists():
+            return candidate
+        pytest.skip("gost_report.docx недоступен в input/ (машино-зависимый путь)")
+
     def test_priority_gives_fewer_headers_than_old(self):
         """Приоритетная система даёт меньше заголовков, чем старая (42).
 
@@ -394,8 +410,9 @@ class TestGostReportRegression:
         )
 
         mgr = get_manager()
+        file_path = self._gost_report_path()
         parsed = mgr.parse(
-            "/home/z/my-project/upload/gost_report.docx",
+            str(file_path),
             parameters={"with_attachments": "false", "structure_type": "tree"},
         )
         raw_tree = build_full_tree(parsed.to_api_schema().content.structure, None)
@@ -449,8 +466,9 @@ class TestGostReportRegression:
         )
 
         mgr = get_manager()
+        file_path = self._gost_report_path()
         parsed = mgr.parse(
-            "/home/z/my-project/upload/gost_report.docx",
+            str(file_path),
             parameters={"with_attachments": "false", "structure_type": "tree"},
         )
         raw_tree = build_full_tree(parsed.to_api_schema().content.structure, None)

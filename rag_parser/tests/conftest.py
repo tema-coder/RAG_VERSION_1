@@ -313,6 +313,16 @@ def pdf_page(title, body=""):
 
 
 def make_pdf_files(tmp_path: Path) -> dict:
+    mixed_pages = [
+        pdf_page("Alpha page contains plenty of words to classify confidently."),
+        # Текстовая страница с таблицей (таблица в содержимом страницы).
+        list(pdf_page("Quarterly data page with a table below."))
+        + _table_ops([["Region", "Q1"], ["North", "100"], ["South", "90"]]),
+        # Страница-картинка (нет текстового слоя) внутри текстового PDF.
+        [],
+        # Страница с мусорным текстовым слоем (битые CMap-маркеры).
+        _text_ops(["(cid:12)(cid:3)(cid:44)(cid:7)"] * 12, size=9),
+    ]
     return {
         "pdf_text": _build_pdf(
             [pdf_page("First page of the document."), pdf_page("Second page body.")],
@@ -325,13 +335,14 @@ def make_pdf_files(tmp_path: Path) -> dict:
             tmp_path / "table.pdf",
         ),
         # Валидный PDF БЕЗ текстового слоя — эмуляция скана: страница есть,
-        # текстовых операторов нет. Настоящий OCR отключён, поэтому такой
-        # документ обязан давать 422, а не 400.
+        # текстовых операторов нет. Обрабатывается через OCR-ветку.
         "pdf_scan": _build_pdf(
             [[]],  # ни одного BT/Tj — только пустая страница
             None,
             tmp_path / "scan.pdf",
         ),
+        # Смешанный PDF: текст → текст+таблица → скан → мусорный слой.
+        "pdf_mixed": _build_pdf(mixed_pages, None, tmp_path / "mixed.pdf"),
     }
 
 

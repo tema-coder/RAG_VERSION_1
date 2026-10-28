@@ -49,6 +49,8 @@ class RoutingPlan:
     assignments: List[PageAssignment] = field(default_factory=list)
     table_runs: List[TableRun] = field(default_factory=list)
     ocr_pages: List[int] = field(default_factory=list)  # страницы без слоя
+    #: весь документ классифицирован как скан (все страницы в OCR-ветку)
+    scan_all: bool = False
 
     @property
     def text_parser_pages(self) -> List[int]:
@@ -102,7 +104,8 @@ def build_routing_plan(
     plan = RoutingPlan()
 
     if classification.pdf_type == "scan":
-        # Весь файл — скан, всё в Docling OCR.
+        # Весь файл — скан, всё в OCR-ветку (layout + EasyOCR + TableFormer).
+        plan.scan_all = True
         plan.assignments = [
             PageAssignment(page=p, source="docling_ocr")
             for p in range(classification.total_pages)

@@ -1,21 +1,26 @@
-"""Оркестратор PDF-пайплайна: classify → route → convert → assemble.
+"""Оркестратор PDF-пайплайна (ТЗ promt_for_agent.txt).
 
-Промпт ``promt_for_parse_pdf.txt``, целевой пайплайн:
-1. Классификация PDF: текстовый или скан.
-2. Скан → весь файл в Docling (OCR, ru+en).
-3. Текстовый PDF → детекция таблиц по страницам.
-4. Маршрутизация: без таблиц → Код №1; с таблицами → Docling (без OCR);
-   без слоя → Docling OCR.
-5. Сборка Markdown в порядке страниц.
-6. MD → Dedoc → заголовки → чанкинг (через существующий .md-путь).
+Единый интерфейс: ``parse_pdf(path) -> markdown_str`` (см. ниже).
 
-Отказоустойчивость:
-* Docling упал на табличных страницах → откат на Код №1, warning,
-  ``metadata["lost_tables"]``.
-* Docling упал на скане → ``DoclingError`` с ``X-Error-Type`` (не 500).
+Шаги:
+1. **Шаг 1** — классификация: текстовый PDF или скан
+   (``classify_pdf``: символы + доля площади текста + адекватность слоя).
+   Смешанные страницы (картинки в текстовом PDF, мусорный слой) идут в
+   OCR-ветку.
+2. **Шаг 2 (текстовый PDF)** — постраничная детекция таблиц:
+   * без таблиц → быстрый PyMuPDF → Markdown (без EasyOCR/TableFormer);
+   * с таблицами → рендер в изображение → layout → EasyOCR (текст) +
+     TableFormer (таблицы) → Markdown в порядке чтения.
+3. **Шаг 3 (скан)** — те же страницы через layout + EasyOCR + TableFormer.
+4. **Шаг 4** — итоговый Markdown (не исходный PDF) уходит в dedoc
+   (это делает ``DedocParser._parse_pdf_via_pipeline``).
 
-Наблюдаемость: в метаданные — тип PDF, списки страниц по источникам,
-список Docling-ранов, время по этапам.
+Модели (EasyOCR, layout, TableFormer) — process-wide singletons
+(``pdf_models``), создаются один раз и переиспользуются.
+
+Отказоустойчивость: падение TableFormer/EasyOCR на блоке — fallback
+внутри страницы; падение обработки страницы целиком — откат на
+PyMuPDF (если есть слой), страница не теряется.
 """
 
 from __future__ import annotations
@@ -24,21 +29,16 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from rag_parser.parsers.docling_converter import (
-    DoclingError,
-    DoclingResult,
-    convert as docling_convert,
-)
 from rag_parser.parsers.pdf_classifier import PdfClassification, classify_pdf
+from rag_parser.parsers.pdf_page_processor import process_complex_page
 from rag_parser.parsers.pdf_router import (
     PageResult,
-    RoutingPlan,
     assemble_markdown,
     build_routing_plan,
 )
-from rag_parser.parsers.pdf_table_detector import TableDetectionResult, detect_tables
+from rag_parser.parsers.pdf_table_detector import detect_tables
 from rag_parser.parsers.pdf_text_parser import PdfTextParser
 
 logger = logging.getLogger(__name__)
@@ -57,23 +57,28 @@ def run_pipeline(
     *,
     min_chars_per_page: int = 50,
     text_pages_min_ratio: float = 0.5,
-    ocr_engine: str = "easyocr",
-    ocr_langs: tuple = ("ru", "en"),
+    min_area_ratio: float = 0.002,
+    min_valid_char_ratio: float = 0.7,
+    easyocr_langs: Tuple[str, ...] = ("ru", "en"),
+    render_dpi: int = 200,
 ) -> PdfPipelineResult:
-    """Основной пайплайн обработки PDF.
+    """Основной пайплайн обработки PDF (ТЗ шаги 1–3).
 
+    Ошибка любого этапа не теряет страницу: внутри страниц действует
+    многоуровневый fallback (layout → OCR → текстовый слой).
     :return: ``PdfPipelineResult`` с Markdown и метаданными наблюдаемости.
-    :raises DoclingError: если скан и Docling упал (не 500, а понятная ошибка).
     """
     timings: Dict[str, float] = {}
-    metadata: Dict[str, Any] = {"source_pipeline": "pdf_router"}
+    metadata: Dict[str, Any] = {"source_pipeline": "pdf_page_router"}
 
-    # --- Этап 1: классификация ---
+    # --- Этап 1: классификация (шаг 1 ТЗ) ---
     t0 = time.perf_counter()
     classification = classify_pdf(
         path,
         min_chars_per_page=min_chars_per_page,
         text_pages_min_ratio=text_pages_min_ratio,
+        min_area_ratio=min_area_ratio,
+        min_valid_char_ratio=min_valid_char_ratio,
     )
     timings["classify"] = time.perf_counter() - t0
     metadata["pdf_type"] = classification.pdf_type
@@ -81,114 +86,142 @@ def run_pipeline(
     metadata["text_pages"] = classification.text_pages
     metadata["scan_pages"] = classification.scan_pages
 
-    # --- Этап 2: детекция таблиц (только для текстовых PDF) ---
-    table_detection: Optional[TableDetectionResult] = None
-    if classification.pdf_type == "text":
-        t0 = time.perf_counter()
-        table_detection = detect_tables(path)
-        timings["table_detect"] = time.perf_counter() - t0
+    import fitz
+    doc = fitz.open(str(path))
+    try:
+        # --- Этап 2: детекция таблиц (только для текстовых PDF) ---
+        table_detection = None
+        if classification.pdf_type == "text":
+            t0 = time.perf_counter()
+            table_detection = detect_tables(path)
+            timings["table_detect"] = time.perf_counter() - t0
 
-    # --- Этап 3: план маршрутизации ---
-    plan = build_routing_plan(classification, table_detection)
-    metadata["routing"] = {
-        "text_parser_pages": plan.text_parser_pages,
-        "docling_pages": plan.docling_pages,
-        "docling_ocr_pages": plan.docling_ocr_pages,
-        "table_runs": [r.pages for r in plan.table_runs],
-    }
+        # --- Этап 3: план маршрутизации ---
+        plan = build_routing_plan(classification, table_detection)
+        metadata["routing"] = {
+            "text_parser_pages": plan.text_parser_pages,
+            "table_pages": plan.docling_pages,
+            "ocr_pages": plan.docling_ocr_pages,
+            "table_runs": [r.pages for r in plan.table_runs],
+        }
 
-    # --- Этап 4: выполнение плана ---
-    results: List[PageResult] = []
-    docling_runs: List[Dict[str, Any]] = []
-    lost_tables: List[int] = []
-
-    if classification.pdf_type == "scan":
-        # Скан — весь файл в Docling OCR.
-        t0 = time.perf_counter()
-        try:
-            dr = docling_convert(
-                path, with_ocr=True, ocr_engine=ocr_engine, ocr_langs=ocr_langs
+        # --- Этап 4: постраничная обработка (шаги 2 и 3 ТЗ) ---
+        results: List[PageResult] = []
+        failed_pages: List[int] = []
+        t_start = time.perf_counter()
+        for pno in range(classification.total_pages):
+            t0 = time.perf_counter()
+            md, route = _process_single_page(
+                doc, pno, plan=plan, easyocr_langs=easyocr_langs,
+                render_dpi=render_dpi,
             )
-            results.append(PageResult(
-                pages=list(range(classification.total_pages)),
-                source="docling_ocr", markdown=dr.markdown))
-            docling_runs.append({"source": "docling_ocr", "pages": dr.page_range})
-        except DoclingError:
-            raise  # скан без Docling — ошибка с понятным типом
-        timings["docling_ocr"] = time.perf_counter() - t0
-    else:
-        # Текстовый PDF — три потока.
+            timings[f"page_{pno}"] = time.perf_counter() - t0
+            if route.startswith(("fallback", "empty")) or not md.strip():
+                failed_pages.append(pno)
+            if md.strip():
+                results.append(PageResult(pages=[pno], source=route, markdown=md))
+        timings["process_all_pages"] = time.perf_counter() - t_start
 
-        # 4a. Код №1: текстовые страницы без таблиц.
-        text_pages = plan.text_parser_pages
-        if text_pages:
-            t0 = time.perf_counter()
-            text_map = PdfTextParser.extract_pages(path, pages=text_pages)
-            for pno, text in text_map.items():
-                if text.strip():
-                    results.append(PageResult(pages=[pno], source="text_parser",
-                                              markdown=text))
-            timings["text_parser"] = time.perf_counter() - t0
+        # --- Этап 5: сборка Markdown в порядке страниц ---
+        t0 = time.perf_counter()
+        markdown = assemble_markdown(results)
+        timings["assemble"] = time.perf_counter() - t0
+    finally:
+        doc.close()
 
-        # 4b. Docling (без OCR): табличные раны.
-        for run in plan.table_runs:
-            t0 = time.perf_counter()
-            try:
-                dr = docling_convert(path, pages=run.pages, with_ocr=False)
-                results.append(PageResult(pages=run.pages, source="docling",
-                                          markdown=dr.markdown))
-                docling_runs.append({"source": "docling", "pages": dr.page_range})
-            except DoclingError as exc:
-                # Fallback: откат на Код №1 для этих страниц.
-                logger.warning("docling_table_fallback pages=%s err=%s",
-                               run.pages, exc)
-                lost_tables.extend(run.pages)
-                text_map = PdfTextParser.extract_pages(path, pages=run.pages)
-                for pno, text in text_map.items():
-                    if text.strip():
-                        results.append(PageResult(pages=[pno], source="text_parser",
-                                                  markdown=text))
-            timings[f"docling_run_{run.pages[0]}"] = time.perf_counter() - t0
-
-        # 4c. Docling OCR: страницы без текстового слоя.
-        ocr_pages = plan.docling_ocr_pages
-        if ocr_pages:
-            t0 = time.perf_counter()
-            try:
-                dr = docling_convert(
-                    path, pages=ocr_pages, with_ocr=True,
-                    ocr_engine=ocr_engine, ocr_langs=ocr_langs)
-                results.append(PageResult(pages=ocr_pages, source="docling_ocr",
-                                          markdown=dr.markdown))
-                docling_runs.append({"source": "docling_ocr", "pages": dr.page_range})
-            except DoclingError as exc:
-                logger.warning("docling_ocr_fallback pages=%s err=%s",
-                               ocr_pages, exc)
-                # Страницы без слоя и без OCR — текст теряется молча,
-                # но не валим весь документ.
-                lost_tables.extend(ocr_pages)
-            timings["docling_ocr_pages"] = time.perf_counter() - t0
-
-    # --- Этап 5: сборка Markdown ---
-    t0 = time.perf_counter()
-    markdown = assemble_markdown(results)
-    timings["assemble"] = time.perf_counter() - t0
-
-    metadata["docling_runs"] = docling_runs
-    metadata["lost_tables"] = lost_tables
+    metadata["page_routes"] = [r.source for r in sorted(
+        results, key=lambda r: r.pages[0])]
+    metadata["failed_pages"] = failed_pages
     metadata["timings"] = timings
-
     logger.info(
         "pdf_pipeline_done",
         extra={
             "file": path.name,
             "pdf_type": classification.pdf_type,
-            "results": len(results),
             "markdown_len": len(markdown),
-            "lost_tables": len(lost_tables),
+            "failed_pages": len(failed_pages),
         },
     )
     return PdfPipelineResult(markdown=markdown, metadata=metadata)
 
 
-__all__ = ["PdfPipelineResult", "run_pipeline"]
+def _process_single_page(
+    doc, pno: int, *,
+    plan, easyocr_langs: Tuple[str, ...], render_dpi: int,
+) -> Tuple[str, str]:
+    """Маршрут + обработка одной страницы. Возвращает ``(md, маршрут)``."""
+    if plan.scan_all:
+        logger.info("page %d: scan → layout+easyocr+tableformer", pno + 1)
+        return _complex_page(doc, pno, has_text_layer=False,
+                             easyocr_langs=easyocr_langs, render_dpi=render_dpi)
+    assignments = {a.page: a.source for a in plan.assignments}
+    source = assignments.get(pno, "text_parser")
+    if source == "text_parser":
+        # Страница без таблиц: быстрый PyMuPDF, без EasyOCR/TableFormer.
+        logger.info("page %d: text-only → pymupdf", pno + 1)
+        text = PdfTextParser.extract_from_doc(doc, pages=[pno])
+        md = text.get(pno, "").strip()
+        return md, "text-only→pymupdf"
+    if source == "docling":  # страница с таблицами
+        logger.info(
+            "page %d: table → layout+easyocr+tableformer", pno + 1
+        )
+        return _complex_page(doc, pno, has_text_layer=True,
+                             easyocr_langs=easyocr_langs, render_dpi=render_dpi)
+    # docling_ocr — страница-картинка внутри текстового PDF.
+    logger.info("page %d: scan → layout+easyocr+tableformer", pno + 1)
+    return _complex_page(doc, pno, has_text_layer=False,
+                         easyocr_langs=easyocr_langs, render_dpi=render_dpi)
+
+
+def _complex_page(
+    doc, pno: int, *, has_text_layer: bool,
+    easyocr_langs: Tuple[str, ...], render_dpi: int,
+) -> Tuple[str, str]:
+    """Обработка страницы через layout+OCR+TableFormer c fallback'ами."""
+    try:
+        md, route = process_complex_page(
+            doc, pno, dpi=render_dpi, langs=easyocr_langs,
+            has_text_layer=has_text_layer,
+        )
+        if md.strip():
+            return md, route
+        logger.warning("page %d: complex processing produced no text", pno + 1)
+    except Exception as exc:  # noqa: BLE001 - страница не должна теряться
+        logger.warning(
+            "page %d: complex processing failed: %s", pno + 1, exc
+        )
+    # Последний fallback: текстовый слой (если он вообще есть).
+    if has_text_layer:
+        try:
+            text = PdfTextParser.extract_from_doc(doc, pages=[pno]).get(pno, "")
+            if text.strip():
+                return text.strip(), "fallback→pymupdf"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("page %d: pymupdf fallback failed: %s", pno + 1, exc)
+    return "", "empty"
+
+
+def parse_pdf(path: str | Path) -> str:
+    """Единый интерфейс ТЗ: ``parse_pdf(path) -> markdown_str``.
+
+    Опциональный ``parse_pdf(path, config=...)`` переходит в
+    ``run_pipeline`` с параметрами из ``core.config.settings``.
+    """
+    from rag_parser.core.config import settings
+
+    result = run_pipeline(
+        Path(path),
+        min_chars_per_page=settings.PDF_TEXT_MIN_CHARS_PER_PAGE,
+        text_pages_min_ratio=settings.PDF_TEXT_PAGES_MIN_RATIO,
+        min_area_ratio=settings.PDF_TEXT_MIN_AREA_RATIO,
+        min_valid_char_ratio=settings.PDF_TEXT_MIN_VALID_CHAR_RATIO,
+        easyocr_langs=tuple(
+            lang for lang in settings.EASYOCR_LANGS.split(",") if lang
+        ) or ("ru", "en"),
+        render_dpi=settings.PDF_RENDER_DPI,
+    )
+    return result.markdown
+
+
+__all__ = ["PdfPipelineResult", "run_pipeline", "parse_pdf"]

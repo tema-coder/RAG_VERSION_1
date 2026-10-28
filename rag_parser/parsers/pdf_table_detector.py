@@ -36,11 +36,21 @@ class TableDetectionResult:
     tables_per_page: dict  # {page: count}
 
 
-def detect_tables(path: Path, *, pages: List[int] = None) -> TableDetectionResult:
+def detect_tables(
+    path: Path,
+    *,
+    pages: List[int] = None,
+    detector: str = "pymupdf",
+    dpi: int = 200,
+) -> TableDetectionResult:
     """Определяет, на каких страницах PDF есть таблицы.
 
     :param path: путь к PDF.
     :param pages: список страниц для проверки (0-based). ``None`` — все.
+    :param detector: ``"pymupdf"`` (``page.find_tables``), или
+        ``"docling_layout"`` (layout-модель, блоки Table), или ``"auto"``
+        (pymupdf, а при отрицательном результате — layout-модель).
+    :param dpi: разрешение рендера для layout-детекции.
     :return: ``TableDetectionResult`` со списками табличных/текстовых страниц.
     """
     import fitz
@@ -61,9 +71,16 @@ def detect_tables(path: Path, *, pages: List[int] = None) -> TableDetectionResul
             finder = page.find_tables()
             n_tables = len(finder.tables) if finder.tables else 0
             tables_per_page[pno] = n_tables
+            if detector in ("docling_layout",) or (
+                detector == "auto" and n_tables == 0
+            ):
+                # Layout-модель: ищем блоки Table (картинки игнорируются).
+                if _page_has_table_block(pno, dpi, doc=doc):
+                    n_tables = max(n_tables, 1)
+                    tables_per_page[pno] = n_tables
             if n_tables > 0:
                 table_pages.append(pno)
-            else:
+            elif detector != "docling_layout":
                 # Дополнительная эвристика: если на странице много
                 # горизонтальных/вертикальных линий — вероятно таблица.
                 # find_tables уже учитывает это, но для надёжности
@@ -76,6 +93,8 @@ def detect_tables(path: Path, *, pages: List[int] = None) -> TableDetectionResul
                     tables_per_page[pno] = max(n_tables, 1)
                 else:
                     text_pages.append(pno)
+            else:
+                text_pages.append(pno)
     finally:
         doc.close()
 
@@ -93,6 +112,35 @@ def detect_tables(path: Path, *, pages: List[int] = None) -> TableDetectionResul
         },
     )
     return result
+
+
+def _page_has_table_block(page_index: int, dpi: int, doc=None) -> bool:
+    """Есть ли блок Table у layout-детекции этой страницы.
+
+    Использует ``detect_page_layout`` (Docling-модель, при её
+    недоступности — эвристика PyMuPDF). Картины-иллюстрации при этом
+    игнорируются (``LABEL_IGNORE``).
+    """
+    from rag_parser.parsers.pdf_page_processor import (
+        LABEL_TABLE,
+        detect_page_layout,
+    )
+    import fitz
+
+    own_doc = None
+    target_doc = doc
+    try:
+        if target_doc is None:
+            return False
+        blocks = detect_page_layout(target_doc, page_index, dpi=dpi)
+        return any(b.label == LABEL_TABLE for b in blocks)
+    except Exception as exc:  # noqa: BLE001 - layout может отсутствовать
+        logger.debug("layout_table_check_failed page=%d err=%s",
+                     page_index + 1, exc)
+        return False
+    finally:
+        if own_doc is not None:
+            own_doc.close()
 
 
 def _is_horizontal_line(draw: dict) -> bool:

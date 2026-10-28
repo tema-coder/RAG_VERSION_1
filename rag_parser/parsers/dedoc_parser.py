@@ -17,8 +17,9 @@
   ``mistune`` (dedoc markdown не знает, а откат на ``text/plain`` —
   недокументированное поведение, и оно молча ломает разбор при смене версии);
 * ``.pdf`` — обрабатывается отдельным пайплайном (``_parse_pdf_via_pipeline``):
-  классификация → маршрутизация (Код №1 / Docling) → сборка Markdown →
-  существующий ``.md``-маршрут. dedoc больше не читает PDF напрямую;
+  классификация → маршрутизация (PyMuPDF / layout+EasyOCR+TableFormer) →
+  склейка Markdown в порядке страниц → существующий ``.md``-маршрут.
+  dedoc больше не читает PDF напрямую;
 * ``.xls`` — конвертируется в ``.xlsx`` через ``xlrd``+``openpyxl``,
   чтобы не зависеть от LibreOffice на legacy-файлах.
 
@@ -92,8 +93,8 @@ def build_manager() -> Any:
     """DedocManager с урезанным конфигом (без OCR/GPU-ридеров и без PDF).
 
     Ридеры: DOCX, Excel, TXT, CSV/TSV, HTML. PDF больше не читается dedoc-ом
-    напрямую — для PDF используется отдельный пайплайн
-    (``_parse_pdf_via_pipeline``, классификация + Docling), а dedoc
+    напрямую — для PDF используется собственный пайплайн
+    (``_parse_pdf_via_pipeline``, классификация + маршрутизация), а dedoc
     разбирает уже собранный Markdown через ``.md``-маршрут.
     """
     from dedoc import DedocManager
@@ -607,26 +608,30 @@ class DedocParser(BaseParser):
         (mistune → HTML → HtmlReader → ``header_promoter`` → chunking).
         Docling больше не читает PDF напрямую.
         """
-        from rag_parser.parsers.docling_converter import DoclingError
         from rag_parser.parsers.pdf_pipeline import run_pipeline
 
         # Валидация контейнера: файл должен быть настоящим PDF (%PDF-),
         # иначе пайплайн упадёт невнятной ошибкой PyMuPDF.
         self._validate_container(path, ".pdf")
 
-        ocr_langs = tuple(settings.DOCLING_OCR_LANGS.split(","))
+        easyocr_langs = tuple(
+            lang for lang in settings.EASYOCR_LANGS.split(",") if lang
+        ) or tuple(
+            lang for lang in settings.DOCLING_OCR_LANGS.split(",") if lang
+        )
         try:
             pipeline_result = run_pipeline(
                 path,
                 min_chars_per_page=settings.PDF_TEXT_MIN_CHARS_PER_PAGE,
                 text_pages_min_ratio=settings.PDF_TEXT_PAGES_MIN_RATIO,
-                ocr_engine=settings.DOCLING_OCR_ENGINE,
-                ocr_langs=ocr_langs,
+                min_area_ratio=settings.PDF_TEXT_MIN_AREA_RATIO,
+                min_valid_char_ratio=settings.PDF_TEXT_MIN_VALID_CHAR_RATIO,
+                easyocr_langs=easyocr_langs,
+                render_dpi=settings.PDF_RENDER_DPI,
             )
-        except DoclingError as exc:
-            # Скан + Docling упал — понятная ошибка (не 500).
+        except Exception as exc:  # noqa: BLE001 - упаковка ошибки пайплайна
             raise DocumentParseError(
-                f"PDF scan processing failed: {exc.message}",
+                f"PDF processing failed: {exc}",
                 filename=path.name,
             ) from exc
 
@@ -672,9 +677,13 @@ class DedocParser(BaseParser):
         from rag_parser.parsers.header_promoter import promote_headers
 
         full_root = build_full_tree(structure, None)
-        # .md — авторская разметка, promote_non_headers=False.
+        # В склеенном Markdown заголовки ``#`` есть только у страниц из
+        # сложного маршрута (layout), а текст ветки PyMuPDF плоский.
+        # Поэтому для PDF-origin MD разметка НЕ считается авторитетной:
+        # promote_non_headers=True — заголовки из Кода №1 (нумерованные,
+        # полужирные) распознаются в обеих частях и уровни согласуются.
         normalize_markup_levels(full_root)
-        full_root = promote_headers(full_root, promote_non_headers=False)
+        full_root = promote_headers(full_root, promote_non_headers=True)
         reattach_tables(full_root, tables)
         if html_tables:
             from rag_parser.parsers.dedoc_tree import attach_tables_by_position

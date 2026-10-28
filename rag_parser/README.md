@@ -5,13 +5,14 @@
 breadcrumb-обогащением чанков, Child-Parent развёрткой выдачи и эвристикой
 визуальных заголовков, плюс Streamlit UI.
 
-Архитектура: модульный монолит. Только CPU, без OCR, без векторной БД,
-без аутентикации (MVP), синхронный парсинг.
+Архитектура: модульный монолит. Только CPU (OCR-модели при наличии —
+CPU-режим), без векторной БД, без аутентикации (MVP), синхронный парсинг.
 
 ## Возможности
 
 - **14 форматов** через dedoc: `.docx`, `.doc`, `.odt`, `.rtf`, `.xlsx`,
-  `.xls`, `.csv`, `.tsv`, `.pdf` (только текстовый слой), `.html`, `.htm`,
+  `.xls`, `.csv`, `.tsv`, `.pdf` (маршрутизирующий пайплайн: текст/скан/
+  страницы с таблицами — см. «PDF-пайплайн»), `.html`, `.htm`,
   `.txt`, `.xml`, `.md`. Неподдерживаемые (`.pptx`, `.epub`) → `422`.
   `.doc` / `.odt` / `.rtf` требуют системный LibreOffice.
 - Структурное дерево `DocumentNode` в ответе API (урезанное превью для
@@ -38,9 +39,9 @@ breadcrumb-обогащением чанков, Child-Parent развёртко�
 - Системная библиотека `libmagic` (для `python-magic`, проверка типа файла).
 - **LibreOffice** — обязателен для `.doc`, `.odt`, `.rtf`
   (`sudo apt-get install libreoffice-writer libreoffice-calc`).
-- Java/tesseract **не нужны**: PDF читается только с текстовым слоем
-  (`pdf_with_text_layer=true`), OCR и image-ридеры исключены из конфига
-  менеджера (см. «Отклонения»).
+- Java/tesseract **не нужны** как обязательные: PDF обрабатывается
+  собственным пайплайном (PyMuPDF + EasyOCR + TableFormer, модели CPU);
+  dedoc PDF-ридеры исключены из конфига менеджера (см. «PDF-пайплайн»).
 
 ## Установка
 
@@ -120,7 +121,7 @@ Swagger UI: <http://localhost:8000/docs>.
 ## Запуск UI
 
 ```bash
-streamlit run rag_parser/frontend/app.py
+streamlit run frontend/app.py
 ```
 
 UI работает без запущенного API: парсер и чанкеры вызываются напрямую.
@@ -139,6 +140,13 @@ UI работает без запущенного API: парсер и чанк�
 | `SEMANTIC_MODEL_NAME`   | deepvk/USER-bge-m3              | Модель эмбеддингов для semantic-чанкинга                                                   |
 | `SEMANTIC_THRESHOLD`    | 0.5                             | Порог semantic-чанкинга                                                                    |
 | `PDF_VIA_DOCX`          | false                           | Конвертировать PDF в DOCX (pdf2docx) перед разбором. **Ограничение**, см. п. 6 Workarounds |
+| `PDF_TEXT_MIN_CHARS_PER_PAGE` | 50 | Минимум осмысленных символов на странице для отметки «текстовая» |
+| `PDF_TEXT_PAGES_MIN_RATIO`    | 0.5 | Доля текстовых страниц, ниже которой документ считается сканом |
+| `PDF_TEXT_MIN_AREA_RATIO`     | 0.002 | Минимальная доля площади текста от площади страницы (отсев колонтитулов) |
+| `PDF_TEXT_MIN_VALID_CHAR_RATIO` | 0.7 | Доля читаемых символов слоя (отсев кракозябр/битого OCR) |
+| `PDF_TABLE_DETECTOR`    | pymupdf                         | Детектор таблиц: `pymupdf` / `docling_layout` / `auto`             |
+| `PDF_RENDER_DPI`        | 200                             | Разрешение рендера страницы для layout/OCR                        |
+| `EASYOCR_LANGS`         | ru,en                           | Языки EasyOCR (comma-separated)                                   |
 | `BREADCRUMB_MAX_DEPTH`  | 2                               | Максимум последних уровней заголовков в крошке                                             |
 | `TREE_TEXT_PREVIEW_LEN` | 30                              | Длина превью текста узла дерева                                                            |
 | `TEMP_DIR`              | ./temp                          | Каталог для временных файлов                                                               |
@@ -165,12 +173,12 @@ UI работает без запущенного API: парсер и чанк�
 | XLSX     | `.xlsx`         | `ExcelReader` dedoc напрямую — единственный парсер, без обёрток      |
 | XLS      | `.xls`          | Конвертация xlrd→openpyxl внутри `DedocParser`, далее как xlsx       |
 | CSV/TSV  | `.csv`, `.tsv`  | `CSVReader` dedoc напрямую + явные `delimiter`/`encoding=utf-8`      |
-| PDF      | `.pdf`          | **Только текстовый слой**; сканы (без слоя) → **422** «OCR отключён» |
+| PDF      | `.pdf`          | **Пайплайн**: классификация (текст/скан) → постраничный маршрут (без таблиц → PyMuPDF; с таблицами/скан → layout + EasyOCR + TableFormer) → склейка MD → dedoc (через `.md`) |
 | HTML     | `.html`, `.htm` | `HtmlReader` dedoc напрямую + маркерный маршрут таблиц (п. 3a)       |
 | TXT      | `.txt`          | `RawTextReader`, если таблиц нет; иначе → HTML + `HtmlReader`        |
 | XML      | `.xml`          | Свой препроцессор `<section>/<table>/<item>` → HTML → `HtmlReader`   |
 | MD       | `.md`           | `mistune` (плагин `table`) → HTML → `HtmlReader`                     |
-| PDF→DOCX | `.pdf`          | **По умолчанию**: `pdf2docx` → DOCX (п. 6 Workarounds)               |
+| PDF→DOCX | `.pdf`          | Legacy: удалён (PDF обрабатывается собственным пайплайном)          |
 
 `.doc`, `.odt`, `.rtf` — один и тот же документ в разных обёртках: результат
 совпадает побайтово с `.docx`. Реальный вызов при разборе `.odt`:
@@ -204,14 +212,52 @@ DocumentParseError: dedoc failed to parse the document:
 BIFF5 список может быть пуст — тогда для xls работает эвристический
 forward-fill).
 
-Сканированные PDF (без текстового слоя) не поддерживаются — OCR отключён,
-такой документ отклоняется с **HTTP 422** и заголовком
-`X-Error-Type: ocr_disabled`. Это осознанный отказ, а не сбой разбора
-(для сбоев остаётся 400).
-PDF-таблицы в CPU-окружении без Java/tesseract извлекаются текстом (без
-структурированных MD-таблиц): `tabby`-ридер требует Java, pdfminer-ридер —
-tesseract для анализа таблиц. Табличные чанки гарантированы для
-docx/xlsx/csv.
+## PDF-пайплайн
+
+Обработка PDF (ТЗ `promt_for_agent.txt`) построена как маршрутизирующий
+пайплайн `rag_parser/parsers/pdf_pipeline.py` с единым интерфейсом
+`parse_pdf(path) -> markdown_str`:
+
+1. **Классификация** (`pdf_classifier.py`, PyMuPDF): страница «текстовая»,
+   если осмысленных символов ≥ `PDF_TEXT_MIN_CHARS_PER_PAGE`, их площадь
+   ≥ `PDF_TEXT_MIN_AREA_RATIO` и слой адекватен (доля читаемых символов ≥
+   `PDF_TEXT_MIN_VALID_CHAR_RATIO` — отсев кракозябр и битого OCR-слоя).
+   Документ текстовый, если доля таких страниц ≥ `PDF_TEXT_PAGES_MIN_RATIO`.
+   Смешанные случаи (страницы-картинки, мусорный слой) уходят в OCR-ветку.
+2. **Детекция таблиц** на страницах текстового PDF (`pdf_table_detector.py`,
+   `pymupdf.find_tables`).
+3. **Маршрутизация постранично** (`pdf_router.py`):
+   - страница без таблиц → быстрый PyMuPDF → Markdown (EasyOCR и
+     TableFormer НЕ вызываются);
+   - страница с таблицей / скан-страница (`pdf_page_processor.py`) —
+     рендер страницы в изображение → layout-детекция (bbox'ы; картинки
+     игнорируются) → текстовые блоки в EasyOCR, таблицы → TableFormer →
+     сборка блоков в порядке чтения (сверху вниз, с учётом колонок).
+4. **Склейка** Markdown всех страниц строго в исходном порядке номеров
+   страниц. Маршрут каждой страницы логируется
+   (`page 3: text-only → pymupdf`, `page 4: table → layout+easyocr+tableformer`).
+5. **Итоговый Markdown** (не исходный PDF) передаётся в dedoc через
+   существующий `.md-`маршрут (`mistune` → HTML → `HtmlReader`).
+
+Модели (EasyOCR, layout, TableFormer) — process-wide singletons
+(`pdf_models.py`): загружаются один раз и переиспользуются, не создаётся
+заново на каждую страницу. Языки EasyOCR — из конфига (`EASYOCR_LANGS`,
+минимум `ru,en`). Падение TableFormer/EasyOCR на странице не теряет
+страницу: fallback на структурный ``find_tables`` / текстовый слой / OCR
+кропа с логированием warning и отметкой в метаданных (`failed_pages`).
+
+### Ограничения CPU-окружения
+
+В CPU-окружении без Docling/EasyOCR модели автоматически не загружаются:
+layout-детекция откатывается на эвристическую сегментацию PyMuPDF
+(`_layout_via_pymupdf`), табличные страницы на страницах с текстовым слоем
+восстанавливаются через `find_tables().to_markdown()`, OCR-страницы
+(скан) дают пустой результат с предупреждением в логах и пометкой в
+`metadata["failed_pages"]` — краха процесса нет, порядок страниц сохранён.
+
+Сканированный PDF целиком обрабатывается OCR-веткой постранично; если
+OCR недоступен в окружении, возвращается понятная ошибка разбора
+(400, `X-Error-Type: parse_error`), а не заглушечный 500.
 
 ## Качество парсинга: один документ в девяти форматах
 
@@ -558,7 +604,7 @@ curl "http://localhost:8000/api/parse/<document_id>/parents?index=44"
 | 400 | Битый файл, неверные параметры чанкинга                                                     |
 | 404 | `document_id` не найден; удалённый `/api/parse_dedoc`                                       |
 | 413 | Файл больше `MAX_FILE_SIZE_MB`                                                              |
-| 422 | Неподдерживаемый формат (`.pptx`, `.exe`, …); PDF-скан без текстового слоя («OCR отключён») |
+| 422 | Неподдерживаемый формат (`.pptx`, `.exe`, …)                                                |
 | 500 | Непредвиденная ошибка сервера                                                               |
 
 ## Пакетная обработка
