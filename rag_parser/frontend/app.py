@@ -40,8 +40,9 @@ _FORMATS_HELP = ", ".join(
 )
 ACCEPTED_HELP = (
     f"Поддерживается {len(ACCEPTED_TYPES)} форматов: {_FORMATS_HELP}. "
-    "PDF — только текстовый слой, сканы будут отклонены (422, OCR отключён). "
-    "Для doc/odt/rtf требуется системный LibreOffice."
+    "PDF и изображения (png/jpg/jpeg) обрабатываются Docling: текст, сканы "
+    "(встроенный OCR) и таблицы. Для doc/odt/rtf требуется системный "
+    "LibreOffice."
 )
 
 

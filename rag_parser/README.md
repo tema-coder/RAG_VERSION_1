@@ -63,7 +63,7 @@ pip install 'docling[easyocr]'
 
 
 # 4. Установка остального стека
-pip install -r rag_parser/requirements.txt
+pip install -r requirements.txt
 
 # 5. Системная зависимость для .doc/.odt/.rtf
 sudo apt-get install libreoffice-writer libreoffice-calc

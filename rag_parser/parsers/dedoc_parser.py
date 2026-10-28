@@ -1,4 +1,4 @@
-"""Единый парсер документов через ``dedoc`` (14 форматов).
+"""Единый фасад разбора документов: Docling (PDF/изображения) + dedoc.
 
 ``DedocManager.parse(file_path, parameters={...})`` сам выбирает ридер по
 расширению. Используется урезанный ``manager_config`` (только нужные
@@ -16,10 +16,12 @@
 * ``.md`` — ``markdown_preprocessor`` рендерит markdown в HTML через
   ``mistune`` (dedoc markdown не знает, а откат на ``text/plain`` —
   недокументированное поведение, и оно молча ломает разбор при смене версии);
-* ``.pdf`` — обрабатывается отдельным пайплайном (``_parse_pdf_via_pipeline``):
-  классификация → маршрутизация (PyMuPDF / layout+EasyOCR+TableFormer) →
-  склейка Markdown в порядке страниц → существующий ``.md``-маршрут.
-  dedoc больше не читает PDF напрямую;
+* ``.pdf`` — обрабатывается пайплайном Docling (``_parse_via_docling``):
+  ``DocumentConverter`` → ``export_to_markdown()`` → существующий
+  ``.md``-маршрут (mistune → HtmlReader → дерево → чанкинг). dedoc больше
+  не читает PDF напрямую;
+* ``.png`` / ``.jpg`` / ``.jpeg`` — упаковываются в временный PDF через
+  ``img2pdf`` и проходят тот же Docling-пайплайн;
 * ``.xls`` — конвертируется в ``.xlsx`` через ``xlrd``+``openpyxl``,
   чтобы не зависеть от LibreOffice на legacy-файлах.
 
@@ -31,6 +33,7 @@
 
 import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
 
@@ -54,12 +57,18 @@ SUPPORTED_EXTENSIONS: List[str] = [
     ".csv",
     ".tsv",
     ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
     ".html",
     ".htm",
     ".txt",
     ".xml",
     ".md",
 ]
+
+#: Расширения изображений: упаковываются в PDF через img2pdf и идут в Docling.
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
 
 #: Расширения, которые dedoc не умеет читать нативно и которые мы
 #: подменяем на ``.txt`` перед разбором (см. ``prepare_for_parsing``).
@@ -92,10 +101,10 @@ _manager: Any = None
 def build_manager() -> Any:
     """DedocManager с урезанным конфигом (без OCR/GPU-ридеров и без PDF).
 
-    Ридеры: DOCX, Excel, TXT, CSV/TSV, HTML. PDF больше не читается dedoc-ом
-    напрямую — для PDF используется собственный пайплайн
-    (``_parse_pdf_via_pipeline``, классификация + маршрутизация), а dedoc
-    разбирает уже собранный Markdown через ``.md``-маршрут.
+    Ридеры: DOCX, Excel, TXT, CSV/TSV, HTML. PDF и изображения больше не
+    читаются dedoc-ом напрямую — для них используется Docling
+    (``_parse_via_docling``), а dedoc разбирает уже собранный Markdown
+    через ``.md``-маршрут.
     """
     from dedoc import DedocManager
     from dedoc.attachments_handler import AttachmentsHandler
@@ -185,8 +194,8 @@ def get_manager() -> Any:
 def prepare_manager_for_format(extension: str) -> Any:
     """Возвращает менеджер, готовый к разбору указанного формата.
 
-    PDF больше не доходит до dedoc (обрабатывается отдельным пайплайном
-    ``_parse_pdf_via_pipeline``), поэтому bbox-защита не нужна.
+    PDF и изображения больше не доходят до dedoc (обрабатываются Docling-
+    пайплайном ``_parse_via_docling``), поэтому bbox-защита не нужна.
     """
     return get_manager()
 
@@ -417,6 +426,9 @@ _CONTAINER_SIGNATURES = {
     ".docx": (b"PK\x03\x04", "ZIP (OOXML)"),
     ".xlsx": (b"PK\x03\x04", "ZIP (OOXML)"),
     ".pdf": (b"%PDF", "PDF"),
+    ".png": (b"\x89PNG\r\n\x1a\n", "PNG"),
+    ".jpg": (b"\xff\xd8\xff", "JPEG"),
+    ".jpeg": (b"\xff\xd8\xff", "JPEG"),
     # Legacy OLE2-контейнер (OLE2 signature, D0CF11E0A1B11AE1)
     ".doc": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "OLE2"),
     ".xls": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "OLE2"),
@@ -467,12 +479,11 @@ class DedocParser(BaseParser):
         if extension not in SUPPORTED_EXTENSIONS:
             raise UnsupportedFormatError(extension, SUPPORTED_EXTENSIONS)
 
-        # --- Новый PDF-пайплайн (промпт promt_for_parse_pdf.txt) ---
-        # PDF ВСЕГДА через отдельный пайплайн (classify → route → Docling →
-        # assemble Markdown → .md-путь). Прямой dedoc-парсинг PDF и маршрут
-        # через pdf2docx удалены.
-        if extension == ".pdf":
-            return self._parse_pdf_via_pipeline(path, size_bytes)
+        # --- Docling: PDF и изображения ---
+        # PDF и изображения ВСЕГДА через Docling (export_to_markdown →
+        # существующий .md-путь). Никакого альтернативного парсера нет.
+        if extension == ".pdf" or extension in IMAGE_EXTENSIONS:
+            return self._parse_via_docling(path, size_bytes)
 
         self._validate_container(path, extension)
         require_libreoffice(extension, path.name)
@@ -524,8 +535,8 @@ class DedocParser(BaseParser):
 
         content = tree.get("content", {}) or {}
         tables = content.get("tables") or []
-        # PDF больше не доходит сюда (обрабатывается в _parse_pdf_via_pipeline),
-        # поэтому drop_header_only_tables (костыль для pdf2docx) не нужен.
+        # PDF и изображения больше не доходят сюда (обрабатываются
+        # Docling-пайплайном _parse_via_docling).
         if extension in (".xlsx", ".xls"):
             # Точная заливка по диапазонам книги (для xls — по
             # сконвертированному файлу с перенесёнными мёрджами);
@@ -600,51 +611,47 @@ class DedocParser(BaseParser):
             tree=full_root,
         )
 
-    def _parse_pdf_via_pipeline(self, path: Path, size_bytes: int) -> ParseResult:
-        """Новый PDF-пайплайн: classify → route → assemble MD → .md-путь.
+    def _parse_via_docling(self, path: Path, size_bytes: int) -> ParseResult:
+        """PDF/изображение → Docling → Markdown → существующий ``.md``-путь.
 
-        Промпт ``promt_for_parse_pdf.txt``: PDF через маршрутизацию
-        (текст/скан/таблицы) → Markdown → существующий ``.md``-путь
-        (mistune → HTML → HtmlReader → ``header_promoter`` → chunking).
-        Docling больше не читает PDF напрямую.
+        Извлечение содержимого выполняет только Docling. Полученный Markdown
+        проходит прежний маршрут проекта: mistune → HTML → ``HtmlReader`` →
+        дерево → заголовки/таблицы → чанкинг. Это структурирование, а не
+        альтернативный парсинг.
         """
         from rag_parser.parsers.pdf_pipeline import run_pipeline
 
-        # Валидация контейнера: файл должен быть настоящим PDF (%PDF-),
-        # иначе пайплайн упадёт невнятной ошибкой PyMuPDF.
-        self._validate_container(path, ".pdf")
+        extension = path.suffix.lower()
+        self._validate_container(path, extension)
 
-        easyocr_langs = tuple(
-            lang for lang in settings.EASYOCR_LANGS.split(",") if lang
-        ) or tuple(
-            lang for lang in settings.DOCLING_OCR_LANGS.split(",") if lang
-        )
         try:
-            pipeline_result = run_pipeline(
-                path,
-                min_chars_per_page=settings.PDF_TEXT_MIN_CHARS_PER_PAGE,
-                text_pages_min_ratio=settings.PDF_TEXT_PAGES_MIN_RATIO,
-                min_area_ratio=settings.PDF_TEXT_MIN_AREA_RATIO,
-                min_valid_char_ratio=settings.PDF_TEXT_MIN_VALID_CHAR_RATIO,
-                easyocr_langs=easyocr_langs,
-                render_dpi=settings.PDF_RENDER_DPI,
-            )
-        except Exception as exc:  # noqa: BLE001 - упаковка ошибки пайплайна
+            pipeline_result = run_pipeline(path)
+        except Exception as exc:  # noqa: BLE001 - упаковка ошибки Docling
             raise DocumentParseError(
-                f"PDF processing failed: {exc}",
+                f"Docling processing failed for {path}: {exc}",
                 filename=path.name,
             ) from exc
 
         markdown = pipeline_result.markdown
         if not markdown.strip():
             raise DocumentParseError(
-                "PDF pipeline produced no text", filename=path.name
+                f"Docling produced no text for {path}", filename=path.name
             )
 
-        # Сохраняем MD во временный файл и отдаём через существующий .md-путь.
+        # Уникальное имя: документы с одинаковым stem из разных каталогов
+        # не должны перетирать друг друга.
         temp_dir = settings.ensure_temp_dir()
-        md_path = temp_dir / f"{path.stem}_pipeline.md"
-        md_path.write_text(markdown, encoding="utf-8")
+        md_path = temp_dir / f"docling_{uuid.uuid4().hex}_{path.stem}.md"
+        try:
+            md_path.write_text(markdown, encoding="utf-8")
+        except OSError as exc:
+            md_path.unlink(missing_ok=True)
+            raise DocumentParseError(
+                f"Cannot write temporary Markdown for {path}: {exc}",
+                filename=path.name,
+            ) from exc
+
+        converted: Optional[Path] = None
         try:
             prepared = prepare_for_parsing(md_path)
             effective_path = prepared.path
@@ -659,6 +666,13 @@ class DedocParser(BaseParser):
             )
             document = parsed.to_api_schema()
             tree = document.model_dump()
+        except (DocumentParseError, UnsupportedFormatError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - ошибки dedoc
+            raise DocumentParseError(
+                f"dedoc failed to structure Docling Markdown for {path}: {exc}",
+                filename=path.name,
+            ) from exc
         finally:
             md_path.unlink(missing_ok=True)
             if converted is not None:
@@ -677,32 +691,34 @@ class DedocParser(BaseParser):
         from rag_parser.parsers.header_promoter import promote_headers
 
         full_root = build_full_tree(structure, None)
-        # В склеенном Markdown заголовки ``#`` есть только у страниц из
-        # сложного маршрута (layout), а текст ветки PyMuPDF плоский.
-        # Поэтому для PDF-origin MD разметка НЕ считается авторитетной:
-        # promote_non_headers=True — заголовки из Кода №1 (нумерованные,
-        # полужирные) распознаются в обеих частях и уровни согласуются.
+        # Docling сам расставляет заголовки/списки/таблицы в Markdown,
+        # поэтому его разметка авторитетна: не поднимаем абзацы до
+        # заголовков жёсткими эвристиками. normalize_markup_levels лишь
+        # выравнивает шкалу по нумерованным разделам.
         normalize_markup_levels(full_root)
-        full_root = promote_headers(full_root, promote_non_headers=True)
+        full_root = promote_headers(full_root, promote_non_headers=False)
         reattach_tables(full_root, tables)
         if html_tables:
             from rag_parser.parsers.dedoc_tree import attach_tables_by_position
+
             attach_tables_by_position(full_root, html_tables)
 
         final_markdown = full_tree_to_markdown(full_root)
         if not final_markdown.strip():
             raise DocumentParseError(
-                "Converted PDF contains no text", filename=path.name
+                f"Structured document from {path} contains no text",
+                filename=path.name,
             )
         final_markdown = self._clean(final_markdown)
 
         document_id = self._new_document_id()
         paths = self.save_results(document_id, tree, final_markdown)
-        pipeline_metadata = pipeline_result.metadata
+        pipeline_metadata = dict(pipeline_result.metadata)
         pipeline_metadata["format"] = self.format
-        pipeline_metadata["extension"] = ".pdf"
+        pipeline_metadata["extension"] = extension
         pipeline_metadata["size_bytes"] = size_bytes
-        pipeline_metadata["parser"] = "pdf_pipeline"
+        pipeline_metadata["parser"] = "docling"
+        pipeline_metadata["dedoc_version"] = dedoc_version()
         pipeline_metadata["raw_tree_path"] = str(paths["raw_tree"])
         pipeline_metadata["markdown_path"] = str(paths["markdown"])
         pipeline_metadata["output_dir"] = str(paths["output_dir"])
@@ -764,6 +780,7 @@ class DedocParser(BaseParser):
 
 __all__ = [
     "DedocParser",
+    "IMAGE_EXTENSIONS",
     "SUPPORTED_EXTENSIONS",
     "MARKDOWN_FILE_PREFIX",
     "TREE_FILE_PREFIX",

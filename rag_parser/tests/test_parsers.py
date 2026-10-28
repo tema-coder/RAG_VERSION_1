@@ -1,4 +1,4 @@
-"""Тесты единственного парсера — DedocParser (14 форматов)."""
+"""Тесты единственного фасада — DedocParser (Docling + dedoc)."""
 
 import json
 import re
@@ -43,29 +43,28 @@ def parser(tmp_path, monkeypatch):
 
 
 class TestSupported:
-    def test_fourteen_formats(self):
+    def test_supported_formats(self):
         assert DedocParser().supported_extensions() == SUPPORTED_EXTENSIONS
         assert sorted(SUPPORTED_EXTENSIONS) == sorted(
             [".docx", ".doc", ".odt", ".rtf",
              ".xlsx", ".xls", ".csv", ".tsv",
-             ".pdf",
+             ".pdf", ".png", ".jpg", ".jpeg",
              ".html", ".htm", ".txt", ".xml", ".md"]
         )
         assert DedocParser.format == "dedoc"
 
     def test_format_count_matches_tz(self):
-        # 13 расширений из ТЗ + .tsv (решение владельца: .tsv остаётся).
-        assert len(SUPPORTED_EXTENSIONS) == 14
+        # 13 расширений из ТЗ + .tsv (решение владельца) + 3 формата
+        # изображений (png/jpg/jpeg) через Docling.
+        assert len(SUPPORTED_EXTENSIONS) == 17
 
     def test_libreoffice_formats_declared(self):
         from rag_parser.parsers.dedoc_parser import LIBREOFFICE_EXTENSIONS
 
         assert set(LIBREOFFICE_EXTENSIONS) == {".doc", ".odt", ".rtf"}
 
-    # test_parameters_pdf удалён: PDF больше не идёт через dedoc напрямую,
-    # параметры ``pdf_with_text_layer`` нет. PDF обрабатывается отдельным
-    # пайплайном (``_parse_pdf_via_pipeline``), тестируемым в
-    # ``test_pdf_pipeline.py``.
+    # test_parameters_pdf удалён: PDF и изображения не идут через dedoc
+    # напрямую, их извлекает Docling (``_parse_via_docling``).
 
     def test_parameters_tsv(self, tmp_path):
         assert parameters_for_format(".tsv", tmp_path / "a.tsv")["delimiter"] == "\t"
@@ -173,28 +172,73 @@ class TestParseFormats:
         assert "row-0" in result.markdown
 
     def test_pdf_text(self, parser, pdf_files, monkeypatch):
-        # PDF идёт через pdf_pipeline. Docling не установлен в тестовом
-        # окружении — мокаем run_pipeline. Реальный разбор PDF тестируется
-        # в ``test_pdf_pipeline.py``.
+        # PDF идёт через Docling. Модели в юнит-тестах не загружаются —
+        # мокаем run_pipeline. Реальная конвертация проверяется отдельно.
         from rag_parser.parsers import pdf_pipeline
         from rag_parser.parsers.pdf_pipeline import PdfPipelineResult
 
         def _mock(path, **kwargs):
             return PdfPipelineResult(
-                markdown="PDF pipeline mocked for test_pdf_text.",
-                metadata={"source_pipeline": "pdf_router", "pdf_type": "text",
-                          "total_pages": 1, "text_pages": [0], "scan_pages": [],
-                          "routing": {"text_parser_pages": [0], "docling_pages": [],
-                                      "docling_ocr_pages": [], "table_runs": []},
-                          "docling_runs": [], "lost_tables": [], "timings": {},
-                          "format": "dedoc", "extension": ".pdf",
-                          "size_bytes": 100, "parser": "pdf_pipeline"},
+                markdown="# PDF document\n\nDocling mocked body.",
+                metadata={"source_pipeline": "docling", "input_format": "pdf",
+                          "pages": 1, "docling_status": "success",
+                          "extension": ".pdf", "size_bytes": 100,
+                          "parser": "docling"},
             )
 
         monkeypatch.setattr(pdf_pipeline, "run_pipeline", _mock)
         result = parser.parse(pdf_files["pdf_text"])
         assert result.markdown.strip()
-        assert result.metadata["parser"] == "pdf_pipeline"
+        assert result.metadata["parser"] == "docling"
+
+    def test_image_via_docling(self, parser, tmp_path, monkeypatch):
+        from PIL import Image
+
+        from rag_parser.parsers import pdf_pipeline
+        from rag_parser.parsers.pdf_pipeline import PdfPipelineResult
+
+        source = tmp_path / "scan.png"
+        Image.new("RGB", (40, 20), "white").save(source)
+        calls = []
+
+        def _mock(path, **kwargs):
+            calls.append(path)
+            return PdfPipelineResult(
+                markdown="# Скан\n\nТекст изображения.",
+                metadata={"source_pipeline": "docling", "input_format": "image",
+                          "pages": 1, "parser": "docling"},
+            )
+
+        monkeypatch.setattr(pdf_pipeline, "run_pipeline", _mock)
+        result = parser.parse(source)
+
+        assert calls == [source]
+        assert result.metadata["parser"] == "docling"
+        assert result.metadata["extension"] == ".png"
+        assert "Текст изображения" in result.markdown
+
+    def test_markdown_write_failure_is_reported(
+        self, parser, tmp_path, monkeypatch
+    ):
+        from rag_parser.parsers import pdf_pipeline
+        from rag_parser.parsers.pdf_pipeline import PdfPipelineResult
+
+        source = tmp_path / "doc.pdf"
+        source.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        monkeypatch.setattr(
+            pdf_pipeline,
+            "run_pipeline",
+            lambda path: PdfPipelineResult(
+                markdown="# Header\n\nBody", metadata={"parser": "docling"}
+            ),
+        )
+
+        def _boom(self, *args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "write_text", _boom)
+        with pytest.raises(DocumentParseError, match="Cannot write temporary Markdown"):
+            parser.parse(source)
 
     def test_header_recognition_is_deterministic(
         self, header_docs, tmp_path, monkeypatch

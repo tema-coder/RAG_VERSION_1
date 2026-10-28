@@ -36,22 +36,6 @@ class DocumentParseError(DocumentError):
         super().__init__(message, filename=filename)
 
 
-class OcrDisabledError(DocumentParseError):
-    """PDF без текстового слоя: OCR отключён (ТЗ — HTTP 422).
-
-    Сервис работает только с текстовым слоем PDF (ограничение «только CPU,
-    без OCR»). Скан или картинка без текстового слоя разобрать нечем, поэтому
-    это НЕ ошибка парсера, а осознанный отказ: отдельный подтип нужен, чтобы
-    отличать её от настоящих сбоев разбора и отвечать 422, а не 400.
-    """
-
-    #: Текст ошибки зафиксирован ТЗ — используется в тестах и в README.
-    MESSAGE = "PDF без текстового слоя не поддерживается, OCR отключён"
-
-    def __init__(self, *, filename: Optional[str] = None) -> None:
-        super().__init__(self.MESSAGE, filename=filename)
-
-
 class FileTooLargeError(DocumentError):
     def __init__(self, size_bytes: int, max_bytes: int) -> None:
         super().__init__(

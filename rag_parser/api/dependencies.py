@@ -39,6 +39,8 @@ MIME_ALLOWLIST = {
     "application/xml",
     "text/x-markdown",
     "application/pdf",
+    "image/png",
+    "image/jpeg",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-excel",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -116,6 +118,9 @@ def validate_upload(filename: str, data: bytes) -> None:
         logger.warning("Unexpected mime type %s for %s", mime, filename)
         if extension in (
             ".pdf",
+            ".png",
+            ".jpg",
+            ".jpeg",
             ".docx",
             ".xlsx",
             ".xls",

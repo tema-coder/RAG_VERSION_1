@@ -47,40 +47,43 @@ def upload(path, **data):
 
 
 def _mock_pdf_pipeline(monkeypatch):
-    """Мокает PDF-пайплайн для тестов, не использующих фикстуру ``client``.
+    """Мокает Docling-пайплайн для тестов без фикстуры ``client``.
 
-    Docling не установлен в тестовом окружении. ``client``-фикстура в
+    Модели Docling в юнит-тестах не загружаются. ``client``-фикстура в
     ``conftest.py`` уже мокает ``run_pipeline``, но тесты, вызывающие
     ``process_function`` или ``httpx.AsyncClient`` напрямую, должны мокать
-    отдельно. Реальный разбор PDF тестируется в ``test_pdf_pipeline.py``.
+    отдельно. Реальная конвертация проверяется в ``test_docling_real.py``.
     """
     from rag_parser.parsers import pdf_pipeline
     from rag_parser.parsers.pdf_pipeline import PdfPipelineResult
 
     def _mock(path, **kwargs):
-        import fitz
         from rag_parser.core.interfaces import DocumentParseError
-        try:
-            doc = fitz.open(str(path))
-            total = len(doc)
-            doc.close()
-        except Exception as exc:
-            raise DocumentParseError(
-                f"PDF pipeline mock: cannot open {path.name}: {exc}",
-                filename=path.name,
-            ) from exc
+
+        if path.suffix.lower() == ".pdf":
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                raise DocumentParseError(
+                    f"PDF pipeline mock: cannot read {path.name}: {exc}",
+                    filename=path.name,
+                ) from exc
+            if b"%%EOF" not in data:
+                raise DocumentParseError(
+                    f"PDF pipeline mock: broken PDF {path.name}",
+                    filename=path.name,
+                )
         return PdfPipelineResult(
-            markdown=f"PDF pipeline mocked: {path.name}",
-            metadata={"source_pipeline": "pdf_router", "pdf_type": "text",
-                      "total_pages": total, "text_pages": list(range(total)),
-                      "scan_pages": [],
-                      "routing": {"text_parser_pages": list(range(total)),
-                                  "docling_pages": [], "docling_ocr_pages": [],
-                                  "table_runs": []},
-                      "docling_runs": [], "lost_tables": [], "timings": {},
-                      "format": "dedoc", "extension": ".pdf",
-                      "size_bytes": path.stat().st_size if path.exists() else 0,
-                      "parser": "pdf_pipeline"},
+            markdown=f"Docling pipeline mocked: {path.name}",
+            metadata={
+                "source_pipeline": "docling",
+                "input_format": "pdf",
+                "pages": 1,
+                "format": "dedoc",
+                "extension": path.suffix.lower(),
+                "size_bytes": path.stat().st_size if path.exists() else 0,
+                "parser": "docling",
+            },
         )
 
     monkeypatch.setattr(pdf_pipeline, "run_pipeline", _mock)
@@ -116,7 +119,7 @@ class TestMetaEndpoints:
             assert extension in body["supported_extensions"]
         assert ".pptx" not in body["supported_extensions"]
         assert ".epub" not in body["supported_extensions"]
-        assert len(body["supported_extensions"]) == 14
+        assert len(body["supported_extensions"]) == len(SUPPORTED_EXTENSIONS)
         assert body["max_file_size_mb"] == settings.MAX_FILE_SIZE_MB
         assert body["chunking_types"] == CHUNKING_TYPES
 
@@ -144,10 +147,9 @@ class TestParse:
         assert body["document_id"]
         assert body["markdown"].strip()
         assert body["chunks"] is None
-        # PDF идёт через pdf_pipeline (классификация + Docling), остальные
-        # форматы — через dedoc напрямую. Проверяем только, что парсер
-        # определён, без жёсткого сравнения с «dedoc».
-        assert body["metadata"]["parser"] in ("dedoc", "pdf_pipeline")
+        # PDF идёт через Docling-пайплайн, остальные — через dedoc
+        # напрямую. Проверяем только, что парсер определён.
+        assert body["metadata"]["parser"] in ("dedoc", "docling")
         assert body["tree"] is not None
         assert body["tree"]["type"] == "document"
         assert body["tree"]["children"]
@@ -168,14 +170,30 @@ class TestParse:
         assert response.status_code == 200
         body = response.json()
         assert body["format"] == "dedoc"
-        assert body["pages"] is None
+        assert body["pages"] == 1  # Docling pipeline metadata
         assert body["metadata"]["format"] == "dedoc"
-        # PDF идёт через pdf_pipeline, остальные — через dedoc.
-        assert body["metadata"]["parser"] in ("dedoc", "pdf_pipeline")
+        # PDF идёт через Docling-пайплайн, остальные — через dedoc.
+        assert body["metadata"]["parser"] in ("dedoc", "docling")
         assert body["metadata"]["size_bytes"] > 0
-        # В тестах PDF-пайплайн замокан (Docling не установлен), поэтому
-        # содержимое markdown не проверяем — только что он непустой.
-        # Реальный разбор PDF тестируется в ``test_pdf_pipeline.py``.
+        # В тестах Docling-пайплайн замокан, поэтому содержимое markdown
+        # не проверяем — только что он непустой. Реальная конвертация
+        # проверяется в ``test_docling_real.py``.
+        assert body["markdown"].strip()
+
+    @pytest.mark.parametrize("extension", ["png", "jpg", "jpeg"])
+    def test_image_upload_uses_docling(self, client, tmp_path, extension):
+        from PIL import Image
+
+        path = tmp_path / f"scan.{extension}"
+        Image.new("RGB", (40, 20), "white").save(path)
+        files, data = upload(path)
+        response = client.post("/api/parse", files=files, data=data)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["metadata"]["input_format"] == "image"
+        assert body["metadata"]["extension"] == f".{extension}"
+        assert body["metadata"]["parser"] == "docling"
         assert body["markdown"].strip()
 
     @pytest.mark.parametrize("chunking_type", CHUNKING_TYPES)
@@ -506,7 +524,7 @@ class TestEndToEnd:
         payload = client.get(f"/api/parse/{document_id}/download?format=json").json()
         assert payload["markdown"] == body["markdown"]
         assert len(payload["chunks"]) == len(body["chunks"])
-        assert payload["metadata"]["parser"] in ("dedoc", "pdf_pipeline")
+        assert payload["metadata"]["parser"] in ("dedoc", "docling")
 
     def test_csv_table_routes_to_table_chunker(self, client, csv_files):
         files, data = upload(
@@ -777,7 +795,7 @@ class TestFrontendAcceptedTypes:
 
         assert all("." not in item for item in ACCEPTED_TYPES)
         assert all("/" not in item for item in ACCEPTED_TYPES)
-        assert len(ACCEPTED_TYPES) == 14
+        assert len(ACCEPTED_TYPES) == len(SUPPORTED_EXTENSIONS)
 
     def test_unsupported_extensions_absent(self):
         from rag_parser.frontend.app import ACCEPTED_TYPES
@@ -790,7 +808,7 @@ class TestFrontendAcceptedTypes:
 
         for extension in ACCEPTED_TYPES:
             assert extension in ACCEPTED_HELP, f"{extension} не упомянут в help"
-        assert "14" in ACCEPTED_HELP
+        assert str(len(ACCEPTED_TYPES)) in ACCEPTED_HELP
 
     def test_no_hardcoded_list_in_app_source(self):
         """Список не должен дублироваться литералом в коде UI."""

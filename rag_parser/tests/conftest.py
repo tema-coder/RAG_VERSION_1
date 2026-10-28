@@ -430,39 +430,40 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(
         settings, "DEDOC_OUTPUT_DIR", str(tmp_path / "output" / "dedoc_results")
     )
-    # Мокаем PDF-пайплайн для старых API-тестов: Docling не установлен в
-    # тестовом окружении (промпт: «в юнит-тестах Docling не загружается»).
-    # ``test_pdf_pipeline.py`` мокает Docling сам и не использует фикстуру
-    # ``client``, поэтому autouse-мок не нужен.
+    # Мокаем Docling-пайплайн для API-тестов: модели Docling в юнит-тестах
+    # не загружаются. Реальная конвертация проверяется отдельно.
+    # ``test_pdf_pipeline.py`` / ``test_docling_converter.py`` мокают
+    # Docling сами и не используют фикстуру ``client``.
+    from rag_parser.core.interfaces import DocumentParseError
     from rag_parser.parsers import pdf_pipeline
     from rag_parser.parsers.pdf_pipeline import PdfPipelineResult
 
     def _mock_run_pipeline(path, **kwargs):
-        # Битый PDF (сигнатура %PDF есть, но содержимое мусор) → ошибка,
-        # чтобы тесты ``test_broken_pdf`` получали 400, а не 200.
-        import fitz
-        from rag_parser.core.interfaces import DocumentParseError
-        try:
-            doc = fitz.open(str(path))
-            total = len(doc)
-            doc.close()
-        except Exception as exc:
-            raise DocumentParseError(
-                f"PDF pipeline mock: cannot open {path.name}: {exc}",
-                filename=path.name,
-            ) from exc
+        # Битый PDF: сигнатура %PDF есть, но файл обрывается без %%EOF.
+        if path.suffix.lower() == ".pdf":
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                raise DocumentParseError(
+                    f"PDF pipeline mock: cannot read {path.name}: {exc}",
+                    filename=path.name,
+                ) from exc
+            if b"%%EOF" not in data:
+                raise DocumentParseError(
+                    f"PDF pipeline mock: broken PDF {path.name}",
+                    filename=path.name,
+                )
         return PdfPipelineResult(
-            markdown=f"PDF pipeline mocked: {path.name}",
-            metadata={"source_pipeline": "pdf_router", "pdf_type": "text",
-                      "total_pages": total, "text_pages": list(range(total)),
-                      "scan_pages": [],
-                      "routing": {"text_parser_pages": list(range(total)),
-                                  "docling_pages": [], "docling_ocr_pages": [],
-                                  "table_runs": []},
-                      "docling_runs": [], "lost_tables": [], "timings": {},
-                      "format": "dedoc", "extension": ".pdf",
-                      "size_bytes": path.stat().st_size if path.exists() else 0,
-                      "parser": "pdf_pipeline"},
+            markdown=f"Docling pipeline mocked: {path.name}",
+            metadata={
+                "source_pipeline": "docling",
+                "input_format": "image" if path.suffix.lower() in (".png", ".jpg", ".jpeg") else "pdf",
+                "pages": 1,
+                "format": "dedoc",
+                "extension": path.suffix.lower(),
+                "size_bytes": path.stat().st_size if path.exists() else 0,
+                "parser": "docling",
+            },
         )
 
     monkeypatch.setattr(pdf_pipeline, "run_pipeline", _mock_run_pipeline)
